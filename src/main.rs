@@ -1,5 +1,5 @@
 use std::env;
-use std::str::FromStr; // Added missing import
+use std::str::FromStr;
 use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 use tokio;
@@ -9,7 +9,6 @@ mod position_manager;
 mod solana_utils;
 mod wallet;
 
-use cli::CliArgs;
 use position_manager::PositionManager;
 use solana_utils::SolanaRpcClient;
 
@@ -25,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let wallet = wallet::load_wallet();
     let pool_address = Pubkey::from_str(&args.pool_address)
         .map_err(|e| anyhow::anyhow!("Invalid pool address: {}", e))?;
-    let mut position_manager = PositionManager::new(&client, wallet, pool_address).await?;
+    let mut position_manager = PositionManager::new(client, wallet, pool_address).await?;
 
     let initial_mid_price = 150.0;
     let range_width = 20.0;

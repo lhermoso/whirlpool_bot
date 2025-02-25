@@ -1,30 +1,31 @@
 use solana_client::nonblocking::rpc_client::RpcClient;
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::account::Account; // Correct import for Account
+use solana_sdk::account::Account;
+use std::sync::Arc;
 
 pub struct SolanaRpcClient {
-    pub rpc: RpcClient,
+    pub rpc: Arc<RpcClient>,
 }
 
 impl SolanaRpcClient {
     pub fn new(url: &str) -> Result<Self> {
         Ok(Self {
-            rpc: RpcClient::new(url.to_string()),
+            rpc: Arc::new(RpcClient::new(url.to_string())),
         })
     }
 
-    pub async fn get_account_data(&self, pubkey: Pubkey) -> Result<Account> { // Use Account directly
+    #[allow(dead_code)]
+    pub async fn get_account_data(&self, pubkey: Pubkey) -> Result<Account> {
         self.rpc.get_account(&pubkey).await
             .map_err(|e| anyhow::anyhow!("Failed to fetch account data: {}", e))
     }
 }
 
-// Remove Clone implementation since RpcClient isn't clonable
-// impl Clone for SolanaRpcClient {
-//     fn clone(&self) -> Self {
-//         Self {
-//             rpc: self.rpc.clone(),
-//         }
-//     }
-// }
+impl Clone for SolanaRpcClient {
+    fn clone(&self) -> Self {
+        Self {
+            rpc: self.rpc.clone(),
+        }
+    }
+}

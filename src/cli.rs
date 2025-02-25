@@ -1,11 +1,12 @@
 use clap::{Arg, Command};
 
 pub struct CliArgs {
+    #[allow(dead_code)]
     pub keypair_path: String,
-    pub position_mint_address: String,
-    pub interval: u64,
-    pub invest: f64,
     pub pool_address: String,
+    pub position_mint_address: String,
+    pub invest: f64,
+    pub interval: u64,
 }
 
 pub fn parse_args() -> CliArgs {
