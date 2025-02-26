@@ -32,7 +32,7 @@ The bot is designed to maintain an active position around the current market pri
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/whirlpool_bot.git
+git clone https://github.com/lhermoso/whirlpool_bot.git
 cd whirlpool_bot
 ```
 
