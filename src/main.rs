@@ -20,6 +20,30 @@ async fn main() -> anyhow::Result<()> {
     env_logger::init();
     
     let args = cli::parse_args();
+
+    // Print the custom start screen
+    println!(
+        "\n\
+        =============================\n\
+        🌀 Le∞ Hermos🌀 Whirlpool Bot \n\
+        =============================\n"
+    );
+    println!("Configuration:");
+    println!(
+        "  Network: {}\n\
+          Invest Amount: {} SOL\n\
+          Range Percentage: {:.2}%\n\
+          Interval: {} seconds\n\
+          Pool Address: {}\n\
+          Position Mint Address: {}",
+        args.network,
+        args.invest,
+        args.range_percentage,
+        args.interval,
+        args.pool_address,
+        if args.position_mint_address.is_empty() { "None".to_string() } else { args.position_mint_address.clone() }
+    );
+    println!("-------------------------------------\n");
     
     // Set the Whirlpools config based on the network parameter
     match args.network.to_lowercase().as_str() {
