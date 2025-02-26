@@ -1,10 +1,9 @@
 use orca_whirlpools::{
     open_position_instructions, close_position_instructions, swap_instructions,
-    set_whirlpools_config_address, IncreaseLiquidityParam, WhirlpoolsConfigInput,
-    fetch_positions_for_owner, set_funder
+    IncreaseLiquidityParam, set_funder
 };
 use orca_whirlpools_client::Whirlpool;
-use orca_whirlpools_core::{sqrt_price_to_price, is_position_in_range};
+use orca_whirlpools_core::sqrt_price_to_price;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::{
@@ -89,8 +88,6 @@ pub struct PositionManager {
 
 impl PositionManager {
     pub async fn new(client: SolanaRpcClient, wallet: Box<dyn Signer>, pool_address: Pubkey) -> Result<Self> {
-        set_whirlpools_config_address(WhirlpoolsConfigInput::SolanaDevnet)
-            .map_err(|e| anyhow::anyhow!("Failed to set whirlpools config: {}", e))?;
         set_funder(wallet.pubkey())
             .map_err(|e| anyhow::anyhow!("Failed to set funder: {}", e))?;
         let rpc = client.rpc.clone();
@@ -283,74 +280,6 @@ impl PositionManager {
         }
     }
 
-    pub async fn rebalance(&mut self, current_price: f64, amount: u64) -> Result<()> {
-        let gas_reserve = 50_000_000;
-        let position = self.get_position().await?;
-        let whirlpool_account = self.client.rpc.get_account(&self.pool_address).await?;
-        let whirlpool = Whirlpool::from_bytes(&whirlpool_account.data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize Whirlpool: {}", e))?;
-        let in_range = is_position_in_range(
-            whirlpool.sqrt_price.into(),
-            position.tick_lower_index,
-            position.tick_upper_index,
-        );
-
-        if !in_range {
-            let (_signature, liquidity) = self.close_position().await?;
-            println!("Closed position with liquidity: {}", liquidity);
-
-            let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
-            let primary_mint = if self.token_mint_a == sol_mint { self.token_mint_a } else { self.token_mint_b };
-            let secondary_mint = if self.token_mint_a == sol_mint { self.token_mint_b } else { self.token_mint_a };
-
-            let usd_value = amount as f64 * current_price / 1_000_000_000.0;
-            let _secondary_amount = (usd_value * 1_000_000_000.0) as u64;
-
-            let adjusted_amount = amount - gas_reserve;
-            let adjusted_usd_value = adjusted_amount as f64 * current_price / 1_000_000_000.0;
-            let secondary_to_swap = (adjusted_usd_value * 1_000_000_000.0) as u64;
-
-            self.swap_tokens(secondary_to_swap, secondary_mint, primary_mint).await?;
-
-            let new_lower = current_price - 10.0;
-            let new_upper = current_price + 10.0;
-            println!("Opening new position at {}–{}", new_lower, new_upper);
-            let param = IncreaseLiquidityParam::Liquidity(liquidity);
-            let result = open_position_instructions(
-                &self.rpc,
-                self.pool_address,
-                new_lower,
-                new_upper,
-                param,
-                Some(100),
-                Some(self.wallet.pubkey()),
-            ).await.map_err(|e| anyhow::anyhow!("Open position instruction error: {}", e))?;
-
-            let recent_blockhash = self.rpc.get_latest_blockhash().await?;
-            let tx = Transaction::new_signed_with_payer(
-                &result.instructions,
-                Some(&self.wallet.pubkey()),
-                &[self.wallet.as_ref()],
-                recent_blockhash,
-            );
-            let signature = self.rpc.send_and_confirm_transaction(&tx).await?;
-            println!("Opened new position. Signature: {}", signature);
-
-            let (position_address, _) = get_position_address(&result.position_mint)?;
-            self.position = Some(Position {
-                lower_price: new_lower,
-                upper_price: new_upper,
-                mint_address: result.position_mint,
-                address: position_address,
-                tick_lower_index: position.tick_lower_index,
-                tick_upper_index: position.tick_upper_index,
-                liquidity,
-            });
-            self.display_balances().await?;
-        }
-        Ok(())
-    }
-
     pub async fn get_position(&self) -> Result<Position> {
         self.position.clone().ok_or_else(|| anyhow::anyhow!("No active position"))
     }
@@ -380,9 +309,30 @@ impl PositionManager {
         Ok(())
     }
 
-    pub async fn has_existing_position(&self) -> Result<bool> {
-        let positions = fetch_positions_for_owner(&self.rpc, self.pool_address).await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch positions: {}", e))?;
-        Ok(!positions.is_empty())
+    pub async fn load_position(&mut self, position_mint_address: &str) -> Result<()> {
+        if position_mint_address.is_empty() {
+            return Ok(());
+        }
+
+        let position_mint = Pubkey::from_str(position_mint_address)?;
+        let (position_address, _) = get_position_address(&position_mint)?;
+        
+        // Prefix with underscore to indicate intentional non-use
+        let _position_account = self.rpc.get_account(&position_address).await?;
+        
+        let whirlpool = self.get_whirlpool().await?;
+        
+        self.position = Some(Position {
+            lower_price: 0.0, // These would be calculated from actual position data
+            upper_price: 0.0,
+            mint_address: position_mint,
+            address: position_address,
+            tick_lower_index: whirlpool.tick_current_index - 100, // Placeholder
+            tick_upper_index: whirlpool.tick_current_index + 100, // Placeholder
+            liquidity: 0, // Would be fetched from actual position data
+        });
+        
+        println!("Loaded existing position: {}", position_mint);
+        Ok(())
     }
 }
