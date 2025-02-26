@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         if args.position_mint_address.is_empty() { "None".to_string() } else { args.position_mint_address.clone() }
     );
     println!("-------------------------------------\n");
+
     
     // Set the Whirlpools config based on the network parameter
     match args.network.to_lowercase().as_str() {
@@ -59,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("Invalid network: {}. Must be 'mainnet' or 'devnet'", args.network));
         }
     }
+
     
     // Get the appropriate RPC URL based on the network
     let rpc_url = match args.network.to_lowercase().as_str() {
@@ -68,12 +70,48 @@ async fn main() -> anyhow::Result<()> {
     };
     
     let client = SolanaRpcClient::new(&rpc_url)?;
+   
+    // Validate the pool address format
+    println!("Parsing pool address: {}", args.pool_address);
+    let pool_address = match Pubkey::from_str(&args.pool_address) {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            println!("Failed to parse pool address: {}", e);
+            return Err(anyhow::anyhow!("Invalid pool address format: {}. Must be a valid Solana public key (44 characters, base58 encoded)", args.pool_address));
+        }
+    };
+    println!("Pool address parsed successfully: {}", pool_address);
+    
+    // Verify the account exists before initializing position manager
+    println!("Verifying pool account exists...");
+    match client.rpc.get_account(&pool_address).await {
+        Ok(_) => println!("Pool account exists!"),
+        Err(e) => {
+            println!("Failed to fetch pool account: {}", e);
+            return Err(anyhow::anyhow!("Pool account not found or network error. Make sure the pool address is correct and you're connected to the right network. Error: {}", e));
+        }
+    }
 
     let wallet = wallet::load_wallet();
-    let pool_address = Pubkey::from_str(&args.pool_address)
-        .map_err(|e| anyhow::anyhow!("Invalid pool address: {}", e))?;
-    let mut position_manager = PositionManager::new(client, wallet, pool_address).await?;
-
+    println!("Wallet loaded successfully: {}", wallet.pubkey());
+    
+    // Try to initialize position manager with better error reporting
+    println!("Initializing position manager...");
+    let mut position_manager = match PositionManager::new(client, wallet, pool_address).await {
+        Ok(pm) => {
+            println!("Position manager initialized successfully!");
+            pm
+        },
+        Err(e) => {
+            println!("Failed to initialize position manager: {}", e);
+            println!("This could be because:");
+            println!("- The pool address is not a valid Whirlpool pool");
+            println!("- There's an issue with the RPC connection");
+            println!("- The Whirlpool account data is corrupted or in an unexpected format");
+            return Err(anyhow::anyhow!("Failed to initialize position manager: {}", e));
+        }
+    };
+ 
     // Try to load existing position if mint address is provided
     if !args.position_mint_address.is_empty() {
         position_manager.load_position(&args.position_mint_address).await?;

@@ -124,6 +124,37 @@ Orca Whirlpools are concentrated liquidity pools on Solana, similar to Uniswap v
 - **RPC Errors**: If you encounter RPC errors, try using a different RPC endpoint in your `.env` file.
 - **Position Creation Failures**: Some pools may have restrictions or may not be properly initialized. Try with a different pool.
 
+### Specific Error Solutions
+
+#### "String is the wrong size" Error
+
+This error typically occurs due to one of these reasons:
+
+1. **Invalid Pool Address**: The Whirlpool pool address is malformed or doesn't point to a valid Whirlpool pool
+   - Solution: Double-check your pool address. It should be a valid Solana public key (base58 encoded, typically 32-44 characters)
+   - Make sure you're using an address from a real Whirlpool pool on the network you selected (mainnet/devnet)
+
+2. **Wrong Network**: You're trying to access a mainnet pool on devnet or vice versa
+   - Solution: Verify you're using the correct `--network` parameter matching the pool address
+
+3. **RPC Connection Issues**: The RPC endpoint can't properly retrieve the pool data
+   - Solution: Try a different RPC endpoint in your `.env` file or check if your current endpoint is rate-limiting you
+
+#### "Failed to deserialize Whirlpool" Error
+
+This means the address doesn't point to a valid Whirlpool pool:
+
+1. **Check the pool exists**: Use Solana Explorer to verify the address exists
+2. **Verify ownership**: The account should be owned by the Orca Whirlpools program
+3. **Network mismatch**: Make sure you're on the right network (mainnet/devnet)
+
+#### Token Mint Errors
+
+If you see errors related to token mints:
+
+1. **Check token balances**: Ensure your wallet has the tokens required by the pool
+2. **Correct network**: Verify you're on the correct network (some tokens exist only on mainnet)
+
 ### Logs
 
 The bot provides detailed logs of all operations. To increase log verbosity, set the `RUST_LOG` environment variable:
@@ -131,6 +162,16 @@ The bot provides detailed logs of all operations. To increase log verbosity, set
 ```bash
 RUST_LOG=debug cargo run --release -- --pool-address <POOL_ADDRESS>
 ```
+
+## Finding Valid Whirlpool Addresses
+
+To find valid Whirlpool addresses:
+
+1. **Orca App**: Visit [Orca's app](https://www.orca.so/) and explore pools
+2. **Solana Explorer**: Look for accounts owned by the Orca Whirlpools program
+3. **Orca API**: Use Orca's API to get a list of valid pools
+
+Example of a valid pool address format: `CJFCFqVRtMJtbY7VAdREPK23XFbp9GEpS6FbfPWvZbm5`
 
 ## License
 

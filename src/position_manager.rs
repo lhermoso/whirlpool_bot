@@ -92,13 +92,56 @@ impl PositionManager {
             .map_err(|e| anyhow::anyhow!("Failed to set funder: {}", e))?;
         let rpc = client.rpc.clone();
 
-        let whirlpool_account = client.rpc.get_account(&pool_address).await?;
-        let whirlpool = Whirlpool::from_bytes(&whirlpool_account.data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize Whirlpool: {}", e))?;
+        // Get pool account with better error handling
+        println!("Fetching whirlpool account data for {}", pool_address);
+        let whirlpool_account = client.rpc.get_account(&pool_address).await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch whirlpool account: {}", e))?;
+        
+        println!("Account data size: {} bytes", whirlpool_account.data.len());
+        
+        // Verify this is actually a Whirlpool account
+        let whirlpool = match Whirlpool::from_bytes(&whirlpool_account.data) {
+            Ok(w) => {
+                println!("Successfully deserialized Whirlpool data");
+                w
+            },
+            Err(e) => {
+                println!("Error deserializing Whirlpool: {}", e);
+                println!("This likely means the address doesn't point to a valid Whirlpool pool");
+                println!("Account owner: {}", whirlpool_account.owner);
+                println!("Expected Whirlpool Program ID: {}", PROGRAM_ID);
+                return Err(anyhow::anyhow!("Failed to deserialize Whirlpool data: {}. Check that this address is a valid Whirlpool pool on the selected network.", e));
+            }
+        };
 
+        println!("Fetching token mint info");
         let mint_cache = Mutex::new(HashMap::new());
-        let token_mint_a = fetch_mint(&rpc, &whirlpool.token_mint_a, &mint_cache).await?;
-        let token_mint_b = fetch_mint(&rpc, &whirlpool.token_mint_b, &mint_cache).await?;
+        
+        // Fetch token mint A with error handling
+        println!("Fetching token mint A: {}", whirlpool.token_mint_a);
+        let token_mint_a = match fetch_mint(&rpc, &whirlpool.token_mint_a, &mint_cache).await {
+            Ok(mint) => {
+                println!("Token A mint fetched successfully: decimals={}", mint.decimals);
+                mint
+            },
+            Err(e) => {
+                println!("Error fetching token A mint: {}", e);
+                return Err(anyhow::anyhow!("Failed to fetch token A mint: {}", e));
+            }
+        };
+        
+        // Fetch token mint B with error handling
+        println!("Fetching token mint B: {}", whirlpool.token_mint_b);
+        let token_mint_b = match fetch_mint(&rpc, &whirlpool.token_mint_b, &mint_cache).await {
+            Ok(mint) => {
+                println!("Token B mint fetched successfully: decimals={}", mint.decimals);
+                mint
+            },
+            Err(e) => {
+                println!("Error fetching token B mint: {}", e);
+                return Err(anyhow::anyhow!("Failed to fetch token B mint: {}", e));
+            }
+        };
 
         Ok(PositionManager {
             client,
