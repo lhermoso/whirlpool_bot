@@ -125,12 +125,12 @@ async fn main() -> anyhow::Result<()> {
         let current_price = position_manager.get_current_price().await?;
         
         // Calculate range based on percentage
-        let half_percentage = range_percentage / 2.0;
-        let lower_price = current_price * (1.0 - half_percentage / 100.0);
-        let upper_price = current_price * (1.0 + half_percentage / 100.0);
+
+        let lower_price = current_price * (1.0 - range_percentage / 100.0);
+        let upper_price = current_price * (1.0 + range_percentage / 100.0);
         
         println!("No position found. Opening initial position at {}–{} (±{}%)", 
-            lower_price, upper_price, half_percentage);
+            lower_price, upper_price, range_percentage);
         position_manager.open_position_with_balance_check(lower_price, upper_price, amount).await?;
     }
 

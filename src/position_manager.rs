@@ -42,16 +42,6 @@ pub async fn fetch_mint(rpc: &Arc<RpcClient>, mint_address: &Pubkey, cache: &Mut
         .await
         .with_context(|| format!("Failed to fetch account data for mint: {}", mint_address))?;
 
-    let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKpfXGKxYvhqA")?;
-    if mint_account.owner != token_program_id {
-        return Err(anyhow::anyhow!(
-            "Account {} is not a valid SPL Token mint (owner: {}, expected: {})",
-            mint_address,
-            mint_account.owner,
-            token_program_id
-        ));
-    }
-
     let mint = Mint::unpack(&mint_account.data)
         .with_context(|| format!("Failed to unpack mint data for: {}", mint_address))?;
 
