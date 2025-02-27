@@ -111,6 +111,18 @@ async fn main() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("Failed to initialize position manager: {}", e));
         }
     };
+
+    // Check native SOL balance explicitly
+    let sol_balance = position_manager.get_native_sol_balance().await?;
+    println!("Native SOL balance: {} lamports ({:.6} SOL)", 
+        sol_balance, sol_balance as f64 / 1_000_000_000.0);
+    
+    if sol_balance < (args.invest * 1_000_000_000.0) as u64 + 50_000_000 {
+        println!("Warning: Your SOL balance may be insufficient for the requested investment amount");
+        println!("You have: {:.6} SOL, Want to invest: {:.6} SOL (plus 0.05 SOL gas reserve)", 
+            sol_balance as f64 / 1_000_000_000.0, args.invest);
+        println!("Consider using a smaller --invest amount");
+    }
  
     // Try to load existing position if mint address is provided
     if !args.position_mint_address.is_empty() {
@@ -125,7 +137,6 @@ async fn main() -> anyhow::Result<()> {
         let current_price = position_manager.get_current_price().await?;
         
         // Calculate range based on percentage
-
         let lower_price = current_price * (1.0 - range_percentage / 100.0);
         let upper_price = current_price * (1.0 + range_percentage / 100.0);
         
