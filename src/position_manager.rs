@@ -11,6 +11,7 @@ use solana_sdk::{
     signature::{Signature, Signer},
     transaction::Transaction,
     program_pack::Pack,
+    commitment_config::CommitmentLevel,
 };
 use anyhow::{Result, Context};
 use spl_token_2022::state::Mint;
@@ -148,7 +149,7 @@ impl PositionManager {
     }
 
     pub async fn get_current_price(&self) -> Result<f64> {
-        let whirlpool_account = self.rpc.get_account(&self.pool_address).await?;
+        let whirlpool_account = self.client.rpc.get_account(&self.pool_address).await?;
         let whirlpool = Whirlpool::from_bytes(&whirlpool_account.data)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize Whirlpool: {}", e))?;
         Ok(sqrt_price_to_price(
@@ -159,7 +160,7 @@ impl PositionManager {
     }
 
     pub async fn get_whirlpool(&self) -> Result<Whirlpool> {
-        let whirlpool_account = self.rpc.get_account(&self.pool_address).await?;
+        let whirlpool_account = self.client.rpc.get_account(&self.pool_address).await?;
         Whirlpool::from_bytes(&whirlpool_account.data)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize Whirlpool: {}", e))
     }
@@ -174,10 +175,10 @@ impl PositionManager {
         }
         
         // For other tokens, check token accounts
-        let token_accounts = self.rpc.get_token_accounts_by_owner(&self.wallet.pubkey(), TokenAccountsFilter::Mint(token_mint)).await?;
+        let token_accounts = self.client.rpc.get_token_accounts_by_owner(&self.wallet.pubkey(), TokenAccountsFilter::Mint(token_mint)).await?;
         if let Some(account) = token_accounts.first() {
             let account_pubkey = Pubkey::from_str(&account.pubkey)?;
-            let balance = self.rpc.get_token_account_balance(&account_pubkey).await?;
+            let balance = self.client.rpc.get_token_account_balance(&account_pubkey).await?;
             Ok(balance.amount.parse::<u64>()?)
         } else {
             println!("No token account found for mint: {}", token_mint);
@@ -202,7 +203,7 @@ impl PositionManager {
             match self.create_token_account_if_needed(to_mint).await {
                 Ok(_) => {
                     // Verify that the token account is fully initialized by checking its existence
-                    let token_accounts = self.rpc.get_token_accounts_by_owner(
+                    let token_accounts = self.client.rpc.get_token_accounts_by_owner(
                         &self.wallet.pubkey(),
                         TokenAccountsFilter::Mint(to_mint)
                     ).await;
@@ -234,7 +235,7 @@ impl PositionManager {
         // 1. Get swap instructions from SDK
         println!("Retrieving swap instructions...");
         let swap_result = swap_instructions(
-            &self.rpc,
+            &self.client.rpc,
             self.pool_address,
             amount,
             from_mint,
@@ -275,23 +276,14 @@ impl PositionManager {
             }
             
             // 3. Get latest blockhash
-            let recent_blockhash = match self.rpc.get_latest_blockhash().await {
-                Ok(hash) => hash,
-                Err(e) => {
-                    // If we can't get a blockhash, apply backoff and retry
-                    let backoff = Self::calculate_backoff(attempt, base_backoff_ms, max_backoff_ms);
-                    println!("Failed to get blockhash: {}. Retrying in {}ms", e, backoff);
-                    sleep(Duration::from_millis(backoff)).await;
-                    continue;
-                }
-            };
+            let recent_blockhash = self.client.rpc.get_latest_blockhash().await?;
             
             // 4. Create transaction for simulation
             let transaction = Transaction::new(&signers, message.clone(), recent_blockhash);
             
             // 5. Simulate transaction to get compute units
             println!("Simulating transaction to determine compute units...");
-            let simulated_transaction = match self.rpc.simulate_transaction(&transaction).await {
+            let simulated_transaction = match self.client.rpc.simulate_transaction(&transaction).await {
                 Ok(sim) => {
                     if let Some(err) = &sim.value.err {
                         println!("Transaction simulation failed: {:?}", err);
@@ -359,7 +351,7 @@ impl PositionManager {
                 all_instructions.push(compute_limit_instruction);
                 
                 // Add prioritization fees based on recent fees for this pool
-                let prioritization_fees = match self.rpc.get_recent_prioritization_fees(&[self.pool_address]).await {
+                let prioritization_fees = match self.client.rpc.get_recent_prioritization_fees(&[self.pool_address]).await {
                     Ok(fees) => fees,
                     Err(e) => {
                         println!("Failed to get prioritization fees, continuing without them: {}", e);
@@ -405,7 +397,7 @@ impl PositionManager {
             println!("Submitting swap transaction...");
             let start_time = Instant::now();
             
-            match self.rpc.send_transaction_with_config(&final_transaction, transaction_config).await {
+            match self.client.send_transaction_with_config(&final_transaction, transaction_config).await {
                 Ok(sig) => {
                     println!("Transaction submitted with signature: {}", sig);
                     
@@ -416,7 +408,7 @@ impl PositionManager {
                         sleep(Duration::from_millis(1000)).await;
                         
                         // Poll for confirmation
-                        let status_result = self.rpc.get_signature_statuses(&[sig]).await;
+                        let status_result = self.client.rpc.get_signature_statuses(&[sig]).await;
                         match status_result {
                             Ok(response) => {
                                 if let Some(Some(status)) = response.value.get(0) {
@@ -508,7 +500,7 @@ impl PositionManager {
         println!("Creating associated token account for mint: {}", mint);
         
         // First check if token account already exists
-        let token_accounts = self.rpc.get_token_accounts_by_owner(
+        let token_accounts = self.client.rpc.get_token_accounts_by_owner(
             &self.wallet.pubkey(),
             TokenAccountsFilter::Mint(mint)
         ).await;
@@ -526,7 +518,7 @@ impl PositionManager {
         }
         
         // Check which token program the mint uses
-        let token_program_id = match self.rpc.get_account(&mint).await {
+        let token_program_id = match self.client.rpc.get_account(&mint).await {
             Ok(account) => {
                 // Check the owner of the mint account to determine which token program it uses
                 let standard_token_program = spl_token::id();
@@ -571,7 +563,7 @@ impl PositionManager {
         
         for attempt in 0..max_retries {
             // Get a fresh blockhash for each attempt
-            let recent_blockhash = match self.rpc.get_latest_blockhash().await {
+            let recent_blockhash = match self.client.rpc.get_latest_blockhash().await {
                 Ok(hash) => hash,
                 Err(e) => {
                     // If we can't get a blockhash, apply backoff and retry
@@ -591,7 +583,7 @@ impl PositionManager {
             );
             
             let start_time = Instant::now();
-            match self.rpc.send_transaction_with_config(&tx, transaction_config).await {
+            match self.client.send_transaction_with_config(&tx, transaction_config).await {
                 Ok(sig) => {
                     println!("Token account creation transaction submitted: {}", sig);
                     
@@ -602,7 +594,7 @@ impl PositionManager {
                     
                     let mut confirmed = false;
                     while start_poll_time.elapsed() < confirmation_timeout {
-                        match self.rpc.get_signature_statuses(&[sig]).await {
+                        match self.client.rpc.get_signature_statuses(&[sig]).await {
                             Ok(response) => {
                                 if let Some(Some(status)) = response.value.get(0) {
                                     if let Some(err) = &status.err {
@@ -776,7 +768,7 @@ impl PositionManager {
                 let test_param = IncreaseLiquidityParam::TokenA(test_amount_a);
                 
                 let quote_result = match open_position_instructions(
-                    &self.rpc,
+                    &self.client.rpc,
                     self.pool_address,
                     actual_lower_price,
                     actual_upper_price,
@@ -935,7 +927,7 @@ impl PositionManager {
                 let test_param = IncreaseLiquidityParam::TokenB(test_amount_b);
                 
                 let quote_result = match open_position_instructions(
-                    &self.rpc,
+                    &self.client.rpc,
                     self.pool_address,
                     actual_lower_price,
                     actual_upper_price,
@@ -1098,7 +1090,7 @@ impl PositionManager {
 
         println!("Creating position with price range: {} - {}", lower_price, upper_price);
         let result = open_position_instructions(
-            &self.rpc,
+            &self.client.rpc,
             self.pool_address,
             lower_price,
             upper_price,
@@ -1124,7 +1116,7 @@ impl PositionManager {
             );
         }
         
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
+        let recent_blockhash = self.client.rpc.get_latest_blockhash().await?;
         
         // Create transaction with all required signers
         let tx = Transaction::new_signed_with_payer(
@@ -1135,7 +1127,7 @@ impl PositionManager {
         );
         
         println!("Submitting transaction to open position with {} signers...", signers.len());
-        let signature = match self.rpc.send_and_confirm_transaction(&tx).await {
+        let signature = match self.client.send_and_confirm_transaction_with_commitment(&tx, CommitmentLevel::Confirmed).await {
             Ok(sig) => sig,
             Err(e) => {
                 println!("Transaction failed: {}", e);
@@ -1174,6 +1166,10 @@ impl PositionManager {
             tick_upper_index,
             liquidity: result.quote.liquidity_delta,
         });
+        
+        // Add a small delay to give time for the position accounts to be fully created and propagated
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        
         self.display_balances().await?;
         Ok(())
     }
@@ -1183,7 +1179,7 @@ impl PositionManager {
             println!("Closing position: {}", position.mint_address);
 
             let result = close_position_instructions(
-                &self.rpc,
+                &self.client.rpc,
                 position.mint_address,
                 Some(100),
                 Some(self.wallet.pubkey()),
@@ -1201,14 +1197,14 @@ impl PositionManager {
                 );
             }
 
-            let recent_blockhash = self.rpc.get_latest_blockhash().await?;
+            let recent_blockhash = self.client.rpc.get_latest_blockhash().await?;
             let tx = Transaction::new_signed_with_payer(
                 &result.instructions,
                 Some(&self.wallet.pubkey()),
                 &signers,
                 recent_blockhash,
             );
-            let signature = self.rpc.send_and_confirm_transaction(&tx).await?;
+            let signature = self.client.send_and_confirm_transaction_with_commitment(&tx, CommitmentLevel::Confirmed).await?;
             println!("Closed position. Signature: {}", signature);
 
             let liquidity = result.quote.liquidity_delta;
@@ -1233,18 +1229,27 @@ impl PositionManager {
         );
 
         if let Some(ref position) = self.position {
-            let close_result = close_position_instructions(
-                &self.rpc,
+            // Try to get position balances, but don't fail the whole method if it doesn't work
+            match close_position_instructions(
+                &self.client.rpc,
                 position.mint_address,
                 Some(100),
                 Some(self.wallet.pubkey()),
-            ).await.map_err(|e| anyhow::anyhow!("Close position instruction error: {}", e))?;
-            let token_a_balance = close_result.quote.token_est_a as f64 / 10f64.powi(self.token_mint_a_decimals as i32);
-            let token_b_balance = close_result.quote.token_est_b as f64 / 10f64.powi(self.token_mint_b_decimals as i32);
-            println!(
-                "Position Balances:\n- Token A ({:?}): {:.6}\n- Token B ({:?}): {:.6}",
-                self.token_mint_a, token_a_balance, self.token_mint_b, token_b_balance
-            );
+            ).await {
+                Ok(close_result) => {
+                    let token_a_balance = close_result.quote.token_est_a as f64 / 10f64.powi(self.token_mint_a_decimals as i32);
+                    let token_b_balance = close_result.quote.token_est_b as f64 / 10f64.powi(self.token_mint_b_decimals as i32);
+                    println!(
+                        "Position Balances:\n- Token A ({:?}): {:.6}\n- Token B ({:?}): {:.6}",
+                        self.token_mint_a, token_a_balance, self.token_mint_b, token_b_balance
+                    );
+                },
+                Err(e) => {
+                    println!("Note: Could not retrieve position balances (this is normal for newly created positions): {}", e);
+                    println!("Position details: Mint: {}, Price range: {}-{}", 
+                        position.mint_address, position.lower_price, position.upper_price);
+                }
+            }
         }
         Ok(())
     }
@@ -1258,7 +1263,7 @@ impl PositionManager {
         let (position_address, _) = get_position_address(&position_mint)?;
         
         // Prefix with underscore to indicate intentional non-use
-        let _position_account = self.rpc.get_account(&position_address).await?;
+        let _position_account = self.client.rpc.get_account(&position_address).await?;
         
         let whirlpool = self.get_whirlpool().await?;
         
@@ -1277,7 +1282,7 @@ impl PositionManager {
     }
 
     pub async fn get_native_sol_balance(&self) -> Result<u64> {
-        match self.rpc.get_balance(&self.wallet.pubkey()).await {
+        match self.client.rpc.get_balance(&self.wallet.pubkey()).await {
             Ok(balance) => {
                 println!("Native SOL balance: {} lamports ({:.6} SOL)", 
                     balance, balance as f64 / 1_000_000_000.0);
