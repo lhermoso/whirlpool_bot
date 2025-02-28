@@ -2,7 +2,7 @@ use orca_whirlpools::{
     open_position_instructions, close_position_instructions, swap_instructions,
     IncreaseLiquidityParam, set_funder
 };
-use orca_whirlpools_client::Whirlpool;
+use orca_whirlpools_client::{Whirlpool, WHIRLPOOL_ID};
 use orca_whirlpools_core::sqrt_price_to_price;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_request::TokenAccountsFilter;
@@ -19,8 +19,10 @@ use std::collections::HashMap;
 use tokio::sync::Mutex;
 use std::str::FromStr;
 use std::sync::Arc;
-
 use crate::solana_utils::SolanaRpcClient;
+use tokio_retry::Retry;
+use tokio_retry::strategy::ExponentialBackoff;
+use std::time::Duration;
 
 const PROGRAM_ID: Pubkey = Pubkey::new_from_array([
     0x6e, 0xeb, 0x65, 0x4a, 0x8e, 0x36, 0xe7, 0x49, 0xd0, 0x8f, 0xb8, 0x33, 0x5c, 0xd3, 0xa8,
@@ -29,7 +31,9 @@ const PROGRAM_ID: Pubkey = Pubkey::new_from_array([
 ]);
 
 fn get_position_address(position_mint: &Pubkey) -> Result<(Pubkey, u8), anyhow::Error> {
-    Ok(Pubkey::find_program_address(&[b"position", position_mint.as_ref()], &PROGRAM_ID))
+    let seeds = &[b"position", position_mint.as_ref()];
+
+    Pubkey::try_find_program_address(seeds, &WHIRLPOOL_ID).ok_or(anyhow::anyhow!("Invalid Seeds"))
 }
 
 pub async fn fetch_mint(rpc: &Arc<RpcClient>, mint_address: &Pubkey, cache: &Mutex<HashMap<Pubkey, Mint>>) -> Result<Mint> {
@@ -54,6 +58,8 @@ pub async fn fetch_mint(rpc: &Arc<RpcClient>, mint_address: &Pubkey, cache: &Mut
 pub struct Position {
     pub lower_price: f64,
     pub upper_price: f64,
+    #[allow(dead_code)]
+    pub center_price: f64,
     pub mint_address: Pubkey,
     #[allow(dead_code)]
     pub address: Pubkey,
@@ -68,7 +74,6 @@ pub struct PositionManager {
     wallet: Box<dyn Signer>,
     pool_address: Pubkey,
     position: Option<Position>,
-    rpc: Arc<RpcClient>,
     token_mint_a: Pubkey,
     token_mint_b: Pubkey,
     token_mint_a_decimals: u8,
@@ -81,8 +86,7 @@ impl PositionManager {
     pub async fn new(client: SolanaRpcClient, wallet: Box<dyn Signer>, pool_address: Pubkey) -> Result<Self> {
         set_funder(wallet.pubkey())
             .map_err(|e| anyhow::anyhow!("Failed to set funder: {}", e))?;
-        let rpc = client.rpc.clone();
-
+        
         // Get pool account with better error handling
         println!("Fetching whirlpool account data for {}", pool_address);
         let whirlpool_account = client.rpc.get_account(&pool_address).await
@@ -110,7 +114,7 @@ impl PositionManager {
         
         // Fetch token mint A with error handling
         println!("Fetching token mint A: {}", whirlpool.token_mint_a);
-        let token_mint_a = match fetch_mint(&rpc, &whirlpool.token_mint_a, &mint_cache).await {
+        let token_mint_a = match fetch_mint(&client.rpc, &whirlpool.token_mint_a, &mint_cache).await {
             Ok(mint) => {
                 println!("Token A mint fetched successfully: decimals={}", mint.decimals);
                 mint
@@ -123,7 +127,7 @@ impl PositionManager {
         
         // Fetch token mint B with error handling
         println!("Fetching token mint B: {}", whirlpool.token_mint_b);
-        let token_mint_b = match fetch_mint(&rpc, &whirlpool.token_mint_b, &mint_cache).await {
+        let token_mint_b = match fetch_mint(&client.rpc, &whirlpool.token_mint_b, &mint_cache).await {
             Ok(mint) => {
                 println!("Token B mint fetched successfully: decimals={}", mint.decimals);
                 mint
@@ -139,7 +143,6 @@ impl PositionManager {
             wallet,
             pool_address,
             position: None,
-            rpc,
             token_mint_a: whirlpool.token_mint_a,
             token_mint_b: whirlpool.token_mint_b,
             token_mint_a_decimals: token_mint_a.decimals,
@@ -166,27 +169,51 @@ impl PositionManager {
     }
 
     pub async fn get_balance(&self, token_mint: Pubkey) -> Result<u64> {
+        use tokio_retry::Retry;
+        use tokio_retry::strategy::ExponentialBackoff;
+        use std::time::Duration;
+        
+        // Create a retry strategy with exponential backoff
+        let retry_strategy = ExponentialBackoff::from_millis(500)
+            .max_delay(Duration::from_secs(3))
+            .take(3);  // Try up to 3 times
+        
         // Special case for SOL (native token)
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
         
         if token_mint == sol_mint {
-            // Check native SOL balance directly
-            return self.get_native_sol_balance().await;
+            // Check native SOL balance directly with retries
+            return Retry::spawn(retry_strategy, || async {
+                self.get_native_sol_balance().await
+                    .map_err(|e| anyhow::anyhow!("Failed to get native SOL balance: {}", e))
+            }).await;
         }
         
-        // For other tokens, check token accounts
-        let token_accounts = self.client.rpc.get_token_accounts_by_owner(&self.wallet.pubkey(), TokenAccountsFilter::Mint(token_mint)).await?;
-        if let Some(account) = token_accounts.first() {
-            let account_pubkey = Pubkey::from_str(&account.pubkey)?;
-            let balance = self.client.rpc.get_token_account_balance(&account_pubkey).await?;
-            Ok(balance.amount.parse::<u64>()?)
-        } else {
-            println!("No token account found for mint: {}", token_mint);
-            Ok(0)
-        }
+        // For other tokens, check token accounts with retries
+        Retry::spawn(retry_strategy, || async {
+            let token_accounts = self.client.rpc.get_token_accounts_by_owner(
+                &self.wallet.pubkey(), 
+                TokenAccountsFilter::Mint(token_mint)
+            ).await
+                .map_err(|e| anyhow::anyhow!("Failed to get token accounts: {}", e))?;
+                
+            if let Some(account) = token_accounts.first() {
+                let account_pubkey = Pubkey::from_str(&account.pubkey)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse token account pubkey: {}", e))?;
+                    
+                let balance = self.client.rpc.get_token_account_balance(&account_pubkey).await
+                    .map_err(|e| anyhow::anyhow!("Failed to get token account balance: {}", e))?;
+                    
+                Ok(balance.amount.parse::<u64>()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse token balance: {}", e))?)
+            } else {
+                println!("No token account found for mint: {}", token_mint);
+                Ok(0)
+            }
+        }).await
     }
 
-    pub async fn swap_tokens(&self, amount: u64, from_mint: Pubkey, to_mint: Pubkey) -> Result<Signature> {
+    pub async fn swap_tokens(&self, amount: u64, from_mint: Pubkey, to_mint: Pubkey, required_target_amount: Option<u64>) -> Result<Signature> {
         use solana_sdk::compute_budget::ComputeBudgetInstruction;
         use solana_sdk::message::Message;
         use solana_client::rpc_config::RpcSendTransactionConfig;
@@ -421,8 +448,41 @@ impl PositionManager {
                                         println!("Swapped {} from {} to {}.", 
                                             amount as f64 / 1_000_000_000.0, from_mint, to_mint);
                                             
-                                        // Wait a moment for chain state to update
-                                        sleep(Duration::from_secs(2)).await;
+                                        // Wait longer for chain state to update completely (at least 5 seconds)
+                                        sleep(Duration::from_secs(5)).await;
+                                        
+                                        // If a target amount was specified, check that we have enough after the swap
+                                        if let Some(target_amount) = required_target_amount {
+                                            // Check updated balances with multiple retries
+                                            let mut attempts = 0;
+                                            let max_balance_check_attempts = 3;
+                                            
+                                            while attempts < max_balance_check_attempts {
+                                                // Check updated balances
+                                                let target_balance = self.get_balance(to_mint).await?;
+                                                println!("Updated target token balance (attempt {}/{}): {} (needed: {})", 
+                                                    attempts + 1, max_balance_check_attempts, target_balance, target_amount);
+                                                
+                                                if target_balance >= target_amount {
+                                                    println!("Successfully swapped for enough tokens. Continuing...");
+                                                    return Ok(sig);
+                                                } else {
+                                                    println!("Balance still insufficient. Waiting for updates...");
+                                                    attempts += 1;
+                                                    if attempts < max_balance_check_attempts {
+                                                        sleep(Duration::from_secs(2)).await;
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // After all retries, report the final status
+                                            let final_balance = self.get_balance(to_mint).await?;
+                                            if final_balance < target_amount {
+                                                println!("Warning: After swap, still don't have enough target token. Have: {}, Need: {}", final_balance, target_amount);
+                                                println!("Cannot proceed with insufficient token balance.");
+                                                return Err(anyhow::anyhow!("Insufficient target token balance after swap. Have: {}, Need: {}", final_balance, target_amount));
+                                            }
+                                        }
                                         
                                         return Ok(sig);
                                     }
@@ -789,9 +849,9 @@ impl PositionManager {
                             // Swap approximately half the amount of SOL to USDC
                             let sol_to_swap = investment_amount / 2;
                             println!("Attempting to swap {} SOL for USDC", sol_to_swap as f64 / 1_000_000_000.0);
-                            self.swap_tokens(sol_to_swap, self.token_mint_a, self.token_mint_b).await?;
+                            self.swap_tokens(sol_to_swap, self.token_mint_a, self.token_mint_b, Some(approx_usdc_needed)).await?;
                             
-                            // Wait for swap to complete and balances to update
+                            // Wait a moment for balances to update and verify
                             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         }
                         
@@ -836,8 +896,10 @@ impl PositionManager {
                     println!("Not enough SOL. Have: {}, Need: {}", token_a_balance, sol_needed + gas_reserve);
                     
                     // Calculate SOL value of USDC at current price (considering decimal differences)
-                    let decimals_factor = 10u64.pow((self.token_mint_a_decimals - self.token_mint_b_decimals) as u32);
-                    let usdc_in_sol_value = (token_b_balance as f64 * decimals_factor as f64 / current_price) as u64;
+                    let decimals_difference = self.token_mint_a_decimals as i32 - self.token_mint_b_decimals as i32;
+                    let decimals_factor = 10.0_f64.powi(decimals_difference);
+                    
+                    let usdc_in_sol_value = (token_b_balance as f64 * decimals_factor / current_price) as u64;
                     let total_value_in_sol = token_a_balance + usdc_in_sol_value;
                     
                     println!("USDC balance in SOL terms: {} lamports ({} SOL)", 
@@ -875,8 +937,7 @@ impl PositionManager {
                 
                 // Check if we have enough token B
                 if token_b_balance < required_b {
-                    println!("Not enough token B (USDC). Have: {}, Need: {}. Will swap SOL for USDC.", 
-                        token_b_balance, required_b);
+                    println!("Not enough token B (USDC). Have: {}, Need: {}. Will swap SOL for USDC.", token_b_balance, required_b);
                     
                     // Calculate how much SOL to swap to get the needed token B
                     // Add 2% extra to account for slippage and fees
@@ -885,39 +946,51 @@ impl PositionManager {
                     
                     // Convert USDC amount to SOL based on current price
                     // Note: We need to account for decimal differences
-                    let decimals_factor = 10u64.pow((self.token_mint_a_decimals - self.token_mint_b_decimals) as u32) as f64;
-                    let mut sol_to_swap = (token_b_shortfall_with_buffer as f64 * decimals_factor * current_price) as u64;
+                    let decimals_difference = self.token_mint_a_decimals as i32 - self.token_mint_b_decimals as i32;
+                    let decimals_factor = 10.0_f64.powi(decimals_difference);
+                    
+                    // Convert token_b (USDC) to token_a (SOL)
+                    // Formula: token_a = token_b / price * 10^(decimals_a - decimals_b)
+                    let mut sol_to_swap = (token_b_shortfall_with_buffer as f64 / current_price * decimals_factor) as u64;
+                    
+                    // Ensure minimum swap amount to avoid dust swaps (0.001 SOL = 1,000,000 lamports)
+                    // Use 0.01 SOL (10 million lamports) as minimum to ensure meaningful swaps on mainnet
+                    let min_swap_amount = 10_000_000;
+                    if sol_to_swap < min_swap_amount {
+                        println!("Calculated swap amount ({} lamports) is below minimum ({} lamports), using minimum swap amount", 
+                            sol_to_swap, min_swap_amount);
+                        sol_to_swap = min_swap_amount;
+                    }
+                    
+                    // Check if we have enough SOL to swap (accounting for both the swap and position requirements)
+                    if sol_to_swap + required_a > token_a_balance {
+                        println!("Warning: Not enough SOL for both swap and position. Adjusting swap amount.");
+                        let max_available_for_swap = if token_a_balance > required_a {
+                            token_a_balance - required_a
+                        } else {
+                            println!("Critical: Not enough SOL for the position requirements, cannot proceed");
+                            return Err(anyhow::anyhow!("Insufficient SOL balance for position requirements"));
+                        };
+                        
+                        if max_available_for_swap < min_swap_amount {
+                            println!("Available SOL for swap ({} lamports) is below minimum swap amount. Cannot proceed.", max_available_for_swap);
+                            return Err(anyhow::anyhow!("Insufficient SOL balance for minimum swap"));
+                        }
+                        
+                        sol_to_swap = max_available_for_swap;
+                    }
                     
                     println!("Swapping {} SOL ({} lamports) for {} USDC", 
                         sol_to_swap as f64 / 1_000_000_000.0, sol_to_swap, token_b_shortfall_with_buffer as f64 / 1_000_000.0);
                     
-                    // Check if we have enough SOL to swap and still meet our needs
-                    if token_a_balance - sol_to_swap < (sol_needed + gas_reserve) {
-                        println!("Not enough SOL to both swap and maintain position. Adjusting swap amount.");
-                        // Calculate maximum SOL available for swap
-                        let max_swap_available = token_a_balance - (sol_needed + gas_reserve);
-                        if max_swap_available > 1_000_000 { // Only if we have at least 0.001 SOL available
-                            sol_to_swap = max_swap_available;
-                            println!("Adjusted swap amount to {} SOL", sol_to_swap as f64 / 1_000_000_000.0);
-                        } else {
-                            println!("Insufficient SOL to swap and maintain position");
-                            return Err(anyhow::anyhow!("Insufficient SOL to swap for USDC and maintain position"));
-                        }
-                    }
-                    
                     // Swap SOL for token B
-                    self.swap_tokens(sol_to_swap, self.token_mint_a, self.token_mint_b).await?;
+                    self.swap_tokens(sol_to_swap, self.token_mint_a, self.token_mint_b, Some(required_b)).await?;
                     
                     // Wait a moment for balances to update and verify
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    let new_token_b_balance = self.get_balance(self.token_mint_b).await?;
-                    println!("Updated USDC balance: {} (needed: {})", new_token_b_balance, required_b);
                     
-                    if new_token_b_balance < required_b {
-                        println!("Warning: After swap, still don't have enough USDC. Have: {}, Need: {}", 
-                            new_token_b_balance, required_b);
-                        println!("Will attempt to open position with available balances anyway.");
-                    }
+                    // The check for sufficient token_b balance is now handled inside swap_tokens
+                    // No need to check again here
                 }
             } else if is_token_b_sol {
                 // SOL is token B - Similar logic as above but for the other direction
@@ -948,9 +1021,9 @@ impl PositionManager {
                             // Swap approximately half the amount of SOL to token A
                             let sol_to_swap = investment_amount / 2;
                             println!("Attempting to swap {} SOL for token A", sol_to_swap as f64 / 1_000_000_000.0);
-                            self.swap_tokens(sol_to_swap, self.token_mint_b, self.token_mint_a).await?;
+                            self.swap_tokens(sol_to_swap, self.token_mint_b, self.token_mint_a, Some(approx_token_a_needed)).await?;
                             
-                            // Wait for swap to complete and balances to update
+                            // Wait a moment for balances to update and verify
                             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         }
                         
@@ -1026,28 +1099,45 @@ impl PositionManager {
                     
                     // Convert token A amount to SOL based on current price
                     // Note: We need to account for decimal differences
-                    let decimals_factor = 10u64.pow((self.token_mint_b_decimals - self.token_mint_a_decimals) as u32) as f64;
+                    let decimals_difference = self.token_mint_b_decimals as i32 - self.token_mint_a_decimals as i32;
+                    let decimals_factor = 10.0_f64.powi(decimals_difference);
+                    
+                    // Convert token_a (SOL) to token_b (USDC)
+                    // Formula: token_b = token_a * price * 10^(decimals_b - decimals_a)
                     let mut sol_to_swap = (token_a_shortfall_with_buffer as f64 * current_price * decimals_factor) as u64;
+                    
+                    // Ensure minimum swap amount to avoid dust swaps (0.001 SOL = 1,000,000 lamports)
+                    // Use 0.01 SOL (10 million lamports) as minimum to ensure meaningful swaps on mainnet
+                    let min_swap_amount = 10_000_000;
+                    if sol_to_swap < min_swap_amount {
+                        println!("Calculated swap amount ({} lamports) is below minimum ({} lamports), using minimum swap amount", 
+                            sol_to_swap, min_swap_amount);
+                        sol_to_swap = min_swap_amount;
+                    }
+                    
+                    // Check if we have enough SOL to swap (accounting for both the swap and position requirements)
+                    if sol_to_swap + required_b > token_b_balance {
+                        println!("Warning: Not enough SOL for both swap and position. Adjusting swap amount.");
+                        let max_available_for_swap = if token_b_balance > required_b {
+                            token_b_balance - required_b
+                        } else {
+                            println!("Critical: Not enough SOL for the position requirements, cannot proceed");
+                            return Err(anyhow::anyhow!("Insufficient SOL balance for position requirements"));
+                        };
+                        
+                        if max_available_for_swap < min_swap_amount {
+                            println!("Available SOL for swap ({} lamports) is below minimum swap amount. Cannot proceed.", max_available_for_swap);
+                            return Err(anyhow::anyhow!("Insufficient SOL balance for minimum swap"));
+                        }
+                        
+                        sol_to_swap = max_available_for_swap;
+                    }
                     
                     println!("Swapping {} SOL ({} lamports) for {} token A", 
                         sol_to_swap as f64 / 1_000_000_000.0, sol_to_swap, token_a_shortfall_with_buffer);
                     
-                    // Check if we have enough SOL to swap and still meet our needs
-                    if token_b_balance - sol_to_swap < (sol_needed + gas_reserve) {
-                        println!("Not enough SOL to both swap and maintain position. Adjusting swap amount.");
-                        // Calculate maximum SOL available for swap
-                        let max_swap_available = token_b_balance - (sol_needed + gas_reserve);
-                        if max_swap_available > 1_000_000 { // Only if we have at least 0.001 SOL available
-                            sol_to_swap = max_swap_available;
-                            println!("Adjusted swap amount to {} SOL", sol_to_swap as f64 / 1_000_000_000.0);
-                        } else {
-                            println!("Insufficient SOL to swap and maintain position");
-                            return Err(anyhow::anyhow!("Insufficient SOL to swap for token A and maintain position"));
-                        }
-                    }
-                    
                     // Swap SOL for token A
-                    self.swap_tokens(sol_to_swap, self.token_mint_b, self.token_mint_a).await?;
+                    self.swap_tokens(sol_to_swap, self.token_mint_b, self.token_mint_a, Some(required_a)).await?;
                     
                     // Wait a moment for balances to update and verify
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -1075,103 +1165,155 @@ impl PositionManager {
     pub async fn open_position(&mut self, lower_price: f64, upper_price: f64, amount: u64) -> Result<()> {
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
         
-        // Use explicit liquidity parameter instead of token amount
-        // This will ensure the SDK calculates the optimal token distribution
-        let param = if self.token_mint_a == sol_mint {
-            // If token A is SOL
-            IncreaseLiquidityParam::TokenA(amount / 2)
-        } else if self.token_mint_b == sol_mint {
-            // If token B is SOL
-            IncreaseLiquidityParam::TokenB(amount / 2)
-        } else {
-            // Fallback for non-SOL pairs (not currently handling)
-            IncreaseLiquidityParam::TokenA(amount)
-        };
-
-        println!("Creating position with price range: {} - {}", lower_price, upper_price);
-        let result = open_position_instructions(
-            &self.client.rpc,
-            self.pool_address,
-            lower_price,
-            upper_price,
-            param,
-            Some(100), // 1% slippage
-            Some(self.wallet.pubkey()),
-        ).await.map_err(|e| anyhow::anyhow!("Open position instruction error: {}", e))?;
-
-        println!("Position creation details:");
-        println!("Token max A: {}", result.quote.token_max_a);
-        println!("Token max B: {}", result.quote.token_max_b);
-        println!("Liquidity: {}", result.quote.liquidity_delta);
-
-        // Prepare all signers including any additional ones provided by the SDK
-        let mut signers: Vec<&dyn Signer> = vec![self.wallet.as_ref()];
+        // Use higher slippage tolerance to account for price movements
+        // 300 = 3% slippage tolerance
+        let mut slippage_tolerance = Some(300);
         
-        // Add any additional signers from the SDK result
-        if !result.additional_signers.is_empty() {
-            println!("Adding {} additional signers from SDK", result.additional_signers.len());
-            signers.extend(
-                result.additional_signers.iter()
-                    .map(|kp| kp as &dyn Signer),
+        // Add retry logic for position opening
+        let max_retries = 3;
+        let mut attempt = 0;
+        let mut last_error = None;
+        
+        while attempt < max_retries {
+            if attempt > 0 {
+                println!("Retrying position creation (attempt {}/{})", attempt + 1, max_retries);
+                // Add a small delay between retries
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+            attempt += 1;
+            
+            // Recreate the param for each attempt since it can't be reused across iterations
+            let param = if self.token_mint_a == sol_mint {
+                // If token A is SOL
+                IncreaseLiquidityParam::TokenA(amount / 2)
+            } else if self.token_mint_b == sol_mint {
+                // If token B is SOL
+                IncreaseLiquidityParam::TokenB(amount / 2)
+            } else {
+                // Fallback for non-SOL pairs (not currently handling)
+                IncreaseLiquidityParam::TokenA(amount)
+            };
+            
+            println!("Creating position with price range: {} - {}", lower_price, upper_price);
+            
+            // Get a fresh quote for each attempt to account for price movements
+            let result = match open_position_instructions(
+                &self.client.rpc,
+                self.pool_address,
+                lower_price,
+                upper_price,
+                param,
+                slippage_tolerance,
+                Some(self.wallet.pubkey()),
+            ).await {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("Failed to get position instructions: {}", e);
+                    last_error = Some(anyhow::anyhow!("Open position instruction error: {}", e));
+                    continue;
+                }
+            };
+
+            println!("Position creation details:");
+            println!("Token max A: {}", result.quote.token_max_a);
+            println!("Token max B: {}", result.quote.token_max_b);
+            println!("Liquidity: {}", result.quote.liquidity_delta);
+
+            // Prepare all signers including any additional ones provided by the SDK
+            let mut signers: Vec<&dyn Signer> = vec![self.wallet.as_ref()];
+            
+            // Add any additional signers from the SDK result
+            if !result.additional_signers.is_empty() {
+                println!("Adding {} additional signers from SDK", result.additional_signers.len());
+                signers.extend(
+                    result.additional_signers.iter()
+                        .map(|kp| kp as &dyn Signer),
+                );
+            }
+            
+            let recent_blockhash = match self.client.rpc.get_latest_blockhash().await {
+                Ok(bh) => bh,
+                Err(e) => {
+                    println!("Failed to get blockhash: {}", e);
+                    last_error = Some(anyhow::anyhow!("Failed to get blockhash: {}", e));
+                    continue;
+                }
+            };
+            
+            // Create transaction with all required signers
+            let tx = Transaction::new_signed_with_payer(
+                &result.instructions,
+                Some(&self.wallet.pubkey()),
+                &signers,
+                recent_blockhash,
             );
+            
+            println!("Submitting transaction to open position with {} signers...", signers.len());
+            match self.client.send_and_confirm_transaction_with_commitment(&tx, CommitmentLevel::Confirmed).await {
+                Ok(sig) => {
+                    println!("Opened position successfully. Signature: {}", sig);
+                    
+                    let (position_address, _) = get_position_address(&result.position_mint)?;
+                    let whirlpool_account = self.client.rpc.get_account(&self.pool_address).await?;
+                    let _whirlpool = Whirlpool::from_bytes(&whirlpool_account.data)
+                        .map_err(|e| anyhow::anyhow!("Failed to deserialize Whirlpool: {}", e))?;
+                        
+                    // Store correct tick indices for this position
+                    let tick_spacing = _whirlpool.tick_spacing as i32; // Convert to i32 for calculations
+                    
+                    // Convert price to tick index
+                    let price_to_tick_index = |price: f64| -> i32 {
+                        let raw_tick_index = (price.ln() / 1.0001f64.ln()) as i32;
+                        // Round to nearest valid tick based on spacing
+                        (raw_tick_index / tick_spacing) * tick_spacing
+                    };
+                    
+                    let tick_lower_index = price_to_tick_index(lower_price);
+                    let tick_upper_index = price_to_tick_index(upper_price);
+
+                    // Calculate center price using geometric mean
+                    let center_price = (lower_price * upper_price).sqrt();
+
+                    self.position = Some(Position {
+                        lower_price,
+                        upper_price,
+                        center_price,
+                        mint_address: result.position_mint,
+                        address: position_address,
+                        tick_lower_index,
+                        tick_upper_index,
+                        liquidity: result.quote.liquidity_delta,
+                    });
+                    
+                    // Add a small delay to give time for the position accounts to be fully created and propagated
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    
+                    self.display_balances().await?;
+                    return Ok(());
+                },
+                Err(e) => {
+                    println!("Transaction failed: {}", e);
+                    
+                    // Check if error is related to TokenMaxExceeded
+                    let error_str = e.to_string();
+                    if error_str.contains("TokenMaxExceeded") || error_str.contains("0x1781") || error_str.contains("6017") {
+                        println!("Token maximum exceeded - this usually happens due to price movement.");
+                        
+                        // On the last attempt, try with significantly higher slippage
+                        if attempt == max_retries - 1 {
+                            println!("Trying one more time with higher slippage tolerance");
+                            slippage_tolerance = Some(500); // 5% slippage for last attempt
+                        }
+                    }
+                    
+                    last_error = Some(anyhow::anyhow!("Failed to open position: {}", e));
+                    continue;
+                }
+            };
         }
         
-        let recent_blockhash = self.client.rpc.get_latest_blockhash().await?;
-        
-        // Create transaction with all required signers
-        let tx = Transaction::new_signed_with_payer(
-            &result.instructions,
-            Some(&self.wallet.pubkey()),
-            &signers,
-            recent_blockhash,
-        );
-        
-        println!("Submitting transaction to open position with {} signers...", signers.len());
-        let signature = match self.client.send_and_confirm_transaction_with_commitment(&tx, CommitmentLevel::Confirmed).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                println!("Transaction failed: {}", e);
-                println!("This could be due to insufficient token balances or price movement.");
-                println!("Try checking your balances and the current price of the pool.");
-                return Err(anyhow::anyhow!("Failed to open position: {}", e));
-            }
-        };
-        
-        println!("Opened position successfully. Signature: {}", signature);
-
-        let (position_address, _) = get_position_address(&result.position_mint)?;
-        let whirlpool_account = self.client.rpc.get_account(&self.pool_address).await?;
-        let whirlpool = Whirlpool::from_bytes(&whirlpool_account.data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize Whirlpool: {}", e))?;
-            
-        // Store correct tick indices for this position
-        let tick_spacing = whirlpool.tick_spacing as i32; // Convert to i32 for calculations
-        
-        // Convert price to tick index
-        let price_to_tick_index = |price: f64| -> i32 {
-            let raw_tick_index = (price.ln() / 1.0001f64.ln()) as i32;
-            // Round to nearest valid tick based on spacing
-            (raw_tick_index / tick_spacing) * tick_spacing
-        };
-        
-        let tick_lower_index = price_to_tick_index(lower_price);
-        let tick_upper_index = price_to_tick_index(upper_price);
-
-        self.position = Some(Position {
-            lower_price,
-            upper_price,
-            mint_address: result.position_mint,
-            address: position_address,
-            tick_lower_index,
-            tick_upper_index,
-            liquidity: result.quote.liquidity_delta,
-        });
-        
-        // Add a small delay to give time for the position accounts to be fully created and propagated
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        
-        self.display_balances().await?;
-        Ok(())
+        // If we get here, all attempts failed
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Failed to open position after {} attempts", max_retries)))
     }
 
     pub async fn close_position(&mut self) -> Result<(Signature, u128)> {
@@ -1217,7 +1359,75 @@ impl PositionManager {
     }
 
     pub async fn get_position(&self) -> Result<Position> {
-        self.position.clone().ok_or_else(|| anyhow::anyhow!("No active position"))
+        if let Some(ref position) = self.position {
+            // Fetch the position data from the blockchain with retry logic
+            let orca_position = Retry::spawn(
+                ExponentialBackoff::from_millis(500)
+                    .max_delay(Duration::from_secs(5))
+                    .take(5),
+                || async {
+                    let position_account = self.client.rpc.get_account(&position.address).await
+                        .map_err(|e: solana_client::client_error::ClientError| 
+                            anyhow::anyhow!("Failed to get account: {}", e))?;
+                    
+                    let position_data = orca_whirlpools_client::Position::from_bytes(&position_account.data)
+                        .map_err(|e| anyhow::anyhow!("Failed to deserialize position: {}", e))?;
+                    
+                    Ok::<orca_whirlpools_client::Position, anyhow::Error>(position_data)
+                },
+            )
+            .await
+            .map_err(|e: anyhow::Error| anyhow::anyhow!("Failed to fetch position: {}", e))?;
+            
+            // Get the whirlpool data for price calculations
+            let whirlpool_account = self.client.rpc.get_account(&self.pool_address).await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch whirlpool account: {}", e))?;
+                
+            // We don't need the whirlpool object for the current implementation
+            let _whirlpool = Whirlpool::from_bytes(&whirlpool_account.data)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize Whirlpool: {}", e))?;
+            
+            // Calculate accurate prices using tick indices and sqrt price
+            use orca_whirlpools_core::{tick_index_to_price, tick_index_to_sqrt_price, sqrt_price_to_price};
+            
+            // Method 1: Directly calculate prices from tick indices with correct token decimals
+            let lower_price = tick_index_to_price(
+                orca_position.tick_lower_index as i32,
+                self.token_mint_a_decimals,
+                self.token_mint_b_decimals
+            );
+            
+            let upper_price = tick_index_to_price(
+                orca_position.tick_upper_index as i32,
+                self.token_mint_a_decimals,
+                self.token_mint_b_decimals
+            );
+            
+            // Method 2: Calculate center price using sqrt price calculation
+            let position_lower_sqrt_price = tick_index_to_sqrt_price(orca_position.tick_lower_index as i32);
+            let position_upper_sqrt_price = tick_index_to_sqrt_price(orca_position.tick_upper_index as i32);
+            let position_center_sqrt_price = (position_lower_sqrt_price + position_upper_sqrt_price) / 2;
+            
+            let center_price = sqrt_price_to_price(
+                position_center_sqrt_price,
+                self.token_mint_a_decimals,
+                self.token_mint_b_decimals
+            );
+            
+            // Convert from orca_whirlpools_client::Position to our custom Position type
+            Ok(Position {
+                lower_price,
+                upper_price,
+                center_price,
+                mint_address: position.mint_address,
+                address: position.address,
+                tick_lower_index: orca_position.tick_lower_index as i32,
+                tick_upper_index: orca_position.tick_upper_index as i32,
+                liquidity: orca_position.liquidity,
+            })
+        } else {
+            Err(anyhow::anyhow!("No active position"))
+        }
     }
 
     async fn display_balances(&self) -> Result<()> {
@@ -1267,9 +1477,16 @@ impl PositionManager {
         
         let whirlpool = self.get_whirlpool().await?;
         
+        // Initialize with placeholder values - these will be updated
+        // when get_position is called with actual on-chain data
+        let lower_price = 0.0;
+        let upper_price = 0.0;
+        let center_price = 0.0;
+        
         self.position = Some(Position {
-            lower_price: 0.0, // These would be calculated from actual position data
-            upper_price: 0.0,
+            lower_price,
+            upper_price,
+            center_price,
             mint_address: position_mint,
             address: position_address,
             tick_lower_index: whirlpool.tick_current_index - 100, // Placeholder
