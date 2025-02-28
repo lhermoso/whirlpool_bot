@@ -132,49 +132,81 @@ async fn main() -> anyhow::Result<()> {
     let amount = (args.invest * 1_000_000_000.0) as u64;
     let range_percentage = args.range_percentage;
 
-    // If no position exists, open an initial one
-    if position_manager.get_position().await.is_err() {
-        let current_price = position_manager.get_current_price().await?;
-        
-        // Calculate range based on percentage
-        let lower_price = current_price * (1.0 - range_percentage / 100.0);
-        let upper_price = current_price * (1.0 + range_percentage / 100.0);
-        
-        println!("No position found. Opening initial position at {}–{} (±{}%)", 
-            lower_price, upper_price, range_percentage);
-        position_manager.open_position_with_balance_check(lower_price, upper_price, amount).await?;
-    }
-
     // Main monitoring loop
     loop {
         let current_price = position_manager.get_current_price().await?;
         println!("Current price: {}", current_price);
 
-        // Check if position is in range
-        let position = position_manager.get_position().await?;
-        let whirlpool = position_manager.get_whirlpool().await?;
-        let in_range = orca_whirlpools_core::is_position_in_range(
-            whirlpool.sqrt_price.into(),
-            position.tick_lower_index,
-            position.tick_upper_index,
-        );
+        // Check if position exists and is in range
+        match position_manager.get_position().await {
+            Ok(position) => {
+                let whirlpool = position_manager.get_whirlpool().await?;
+                let in_range = orca_whirlpools_core::is_position_in_range(
+                    whirlpool.sqrt_price.into(),
+                    position.tick_lower_index,
+                    position.tick_upper_index,
+                );
 
-        // Rebalance if out of range
-        if !in_range {
-            println!("Price {} outside range {}–{}. Rebalancing...", 
-                current_price, position.lower_price, position.upper_price);
-            
-            // Calculate new range centered on current price using percentage
-            let half_percentage = range_percentage / 2.0;
-            let new_lower = current_price * (1.0 - half_percentage / 100.0);
-            let new_upper = current_price * (1.0 + half_percentage / 100.0);
-            
-            // Close existing position and open a new one
-            position_manager.close_position().await?;
-            println!("Opening new position at {}–{} (±{}%)", new_lower, new_upper, half_percentage);
-            position_manager.open_position_with_balance_check(new_lower, new_upper, amount).await?;
-        } else {
-            println!("Price within range {}–{}", position.lower_price, position.upper_price);
+                // Rebalance if out of range
+                if !in_range {
+                    println!("Price {} outside range {}–{}. Rebalancing...", 
+                        current_price, position.lower_price, position.upper_price);
+                    
+                    // Calculate new range centered on current price using percentage
+                    let half_percentage = range_percentage / 2.0;
+                    let new_lower = current_price * (1.0 - half_percentage / 100.0);
+                    let new_upper = current_price * (1.0 + half_percentage / 100.0);
+                    
+                    // Attempt to close existing position
+                    match position_manager.close_position().await {
+                        Ok(result) => {
+                            println!("Successfully closed position with signature: {}", result.0);
+                            println!("Opening new position at {}–{} (±{}%)", new_lower, new_upper, half_percentage);
+                            
+                            // Verify balances after closing position
+                            let sol_balance = position_manager.get_native_sol_balance().await?;
+                            let invest_amount = if sol_balance < amount {
+                                println!("Warning: SOL balance {} is less than requested investment amount {}. Using available balance.", 
+                                    sol_balance as f64 / 1_000_000_000.0, amount as f64 / 1_000_000_000.0);
+                                sol_balance.saturating_sub(10_000_000) // Reserve 0.01 SOL for gas
+                            } else {
+                                amount
+                            };
+                            
+                            // Open new position with the appropriate amount
+                            position_manager.open_position_with_balance_check(new_lower, new_upper, invest_amount).await?;
+                        },
+                        Err(e) => {
+                            println!("Failed to close position: {}. Will retry next interval.", e);
+                        }
+                    }
+                } else {
+                    println!("Price within range {}–{}", position.lower_price, position.upper_price);
+                }
+            },
+            Err(e) => {
+                println!("No active position found: {}. Creating initial position.", e);
+                
+                // Calculate range based on percentage
+                let lower_price = current_price * (1.0 - range_percentage / 100.0);
+                let upper_price = current_price * (1.0 + range_percentage / 100.0);
+                
+                println!("Opening initial position at {}–{} (±{}%)", 
+                    lower_price, upper_price, range_percentage);
+                    
+                // Check SOL balance before opening position
+                let sol_balance = position_manager.get_native_sol_balance().await?;
+                let invest_amount = if sol_balance < amount {
+                    println!("Warning: SOL balance {} is less than requested investment amount {}. Using available balance.", 
+                        sol_balance as f64 / 1_000_000_000.0, amount as f64 / 1_000_000_000.0);
+                    sol_balance.saturating_sub(10_000_000) // Reserve 0.01 SOL for gas
+                } else {
+                    amount
+                };
+                
+                // Open position with the appropriate amount
+                position_manager.open_position_with_balance_check(lower_price, upper_price, invest_amount).await?;
+            }
         }
 
         // Wait for next check

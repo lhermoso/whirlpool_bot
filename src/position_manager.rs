@@ -220,9 +220,19 @@ impl PositionManager {
         use solana_sdk::commitment_config::CommitmentLevel;
         use tokio::time::{sleep, Duration, Instant};
         
-        let slippage_tolerance = Some(100u16); // 1%
-        println!("Preparing to swap {} from {} to {}", 
-            amount as f64 / 1_000_000_000.0, from_mint, to_mint);
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+        
+        // Use higher slippage tolerance (3%) when swapping to SOL, as SOL price can be volatile
+        let slippage_tolerance = if to_mint == sol_mint {
+            Some(300u16) // 3% slippage when swapping to SOL
+        } else {
+            Some(100u16) // 1% default slippage
+        };
+        
+        println!("Preparing to swap {} from {} to {} (slippage: {}%)", 
+            amount as f64 / if from_mint == sol_mint { 1_000_000_000.0 } else { 1_000_000.0 }, 
+            from_mint, to_mint,
+            slippage_tolerance.unwrap_or(100) as f64 / 100.0);
         
         // Ensure token accounts exist before attempting swap
         if to_mint != Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap() {
@@ -446,7 +456,8 @@ impl PositionManager {
                                         println!("Transaction confirmed!");
                                         println!("Swap transaction successful! Signature: {}", sig);
                                         println!("Swapped {} from {} to {}.", 
-                                            amount as f64 / 1_000_000_000.0, from_mint, to_mint);
+                                            amount as f64 / if from_mint == sol_mint { 1_000_000_000.0 } else { 1_000_000.0 }, 
+                                            from_mint, to_mint);
                                             
                                         // Wait longer for chain state to update completely (at least 5 seconds)
                                         sleep(Duration::from_secs(5)).await;
@@ -912,6 +923,25 @@ impl PositionManager {
                         // We have enough total value, just distributed across tokens
                         println!("You have enough total value, just not enough SOL. Adjusting approach...");
                         
+                        // Try to swap USDC to SOL first
+                        println!("Attempting to swap USDC to SOL to meet position requirements");
+                        match self.swap_usdc_to_sol_if_needed(sol_needed, gas_reserve).await {
+                            Ok(true) => {
+                                // Successfully swapped to get enough SOL, continue with position creation
+                                println!("Successfully swapped USDC to SOL. Continuing with position creation.");
+                                // Break out of the loop and continue with position creation
+                                return Ok(());
+                            },
+                            Ok(false) => {
+                                println!("Could not swap enough USDC to SOL. Trying to reduce position size.");
+                                // Fall through to the existing retry logic with smaller position size
+                            },
+                            Err(e) => {
+                                println!("Error swapping USDC to SOL: {}. Trying to reduce position size.", e);
+                                // Fall through to the existing retry logic with smaller position size
+                            }
+                        }
+                        
                         // Try smaller position size
                         if retry_count < max_retries {
                             let adjusted_amount = (current_amount as f64 * 0.95) as u64; // 5% smaller
@@ -1065,6 +1095,25 @@ impl PositionManager {
                 // Check if we have enough SOL
                 if token_b_balance < (sol_needed + gas_reserve) {
                     println!("Not enough SOL. Have: {}, Need: {}", token_b_balance, sol_needed + gas_reserve);
+                    
+                    // Try to swap USDC to SOL first
+                    println!("Attempting to swap USDC to SOL to meet position requirements");
+                    match self.swap_usdc_to_sol_if_needed(sol_needed, gas_reserve).await {
+                        Ok(true) => {
+                            // Successfully swapped to get enough SOL, continue with position creation
+                            println!("Successfully swapped USDC to SOL. Continuing with position creation.");
+                            // Break out of the loop and continue with position creation
+                            return Ok(());
+                        },
+                        Ok(false) => {
+                            println!("Could not swap enough USDC to SOL. Trying to reduce position size.");
+                            // Fall through to the existing retry logic with smaller position size
+                        },
+                        Err(e) => {
+                            println!("Error swapping USDC to SOL: {}. Trying to reduce position size.", e);
+                            // Fall through to the existing retry logic with smaller position size
+                        }
+                    }
                     
                     // If we don't have enough SOL after multiple retries, return an error
                     if retry_count >= max_retries {
@@ -1327,6 +1376,17 @@ impl PositionManager {
                 Some(self.wallet.pubkey()),
             ).await.map_err(|e| anyhow::anyhow!("Close position instruction error: {}", e))?;
 
+            // Log details about the close position quote to help with debugging
+            println!("Position close details:");
+            println!("- Token A estimate: {} ({})", 
+                result.quote.token_est_a, 
+                result.quote.token_est_a as f64 / 10f64.powi(self.token_mint_a_decimals as i32));
+            println!("- Token B estimate: {} ({})", 
+                result.quote.token_est_b, 
+                result.quote.token_est_b as f64 / 10f64.powi(self.token_mint_b_decimals as i32));
+            println!("- Liquidity delta: {}", result.quote.liquidity_delta);
+            println!("- Number of instructions: {}", result.instructions.len());
+
             // Prepare all signers including any additional ones provided by the SDK
             let mut signers: Vec<&dyn Signer> = vec![self.wallet.as_ref()];
             
@@ -1349,7 +1409,36 @@ impl PositionManager {
             let signature = self.client.send_and_confirm_transaction_with_commitment(&tx, CommitmentLevel::Confirmed).await?;
             println!("Closed position. Signature: {}", signature);
 
+            // Verify that the position is actually closed by checking the position account
             let liquidity = result.quote.liquidity_delta;
+            
+            // Wait a moment for the transaction to be fully confirmed on the network
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            
+            // Try to verify that the position is actually closed
+            match self.client.rpc.get_account(&position.address).await {
+                Ok(account) => {
+                    println!("Warning: Position account still exists after closing! This may indicate a failed closure.");
+                    // Try to deserialize to see if it's still a valid position
+                    match orca_whirlpools_client::Position::from_bytes(&account.data) {
+                        Ok(_) => {
+                            println!("Position data still valid - position NOT closed properly!");
+                            return Err(anyhow::anyhow!("Failed to close position: account still exists with valid data"));
+                        },
+                        Err(_) => {
+                            println!("Position data no longer valid - account may be closing");
+                        }
+                    }
+                },
+                Err(e) => {
+                    if e.to_string().contains("AccountNotFound") {
+                        println!("Position account successfully closed (account not found)");
+                    } else {
+                        println!("Error checking position account: {}", e);
+                    }
+                }
+            }
+            
             self.position = None;
             self.display_balances().await?;
             Ok((signature, liquidity))
@@ -1469,32 +1558,98 @@ impl PositionManager {
             return Ok(());
         }
 
+        println!("Attempting to load position with mint address: {}", position_mint_address);
         let position_mint = Pubkey::from_str(position_mint_address)?;
         let (position_address, _) = get_position_address(&position_mint)?;
         
-        // Prefix with underscore to indicate intentional non-use
-        let _position_account = self.client.rpc.get_account(&position_address).await?;
+        // Try to fetch the position account with retry logic
+        let position_account = match self.client.rpc.get_account(&position_address).await {
+            Ok(account) => {
+                println!("Position account found. Size: {} bytes", account.data.len());
+                account
+            },
+            Err(e) => {
+                println!("Error loading position account: {}", e);
+                return Err(anyhow::anyhow!("Position account not found or inaccessible: {}", e));
+            }
+        };
         
-        let whirlpool = self.get_whirlpool().await?;
+        // Try to deserialize the position data
+        let position_data = match orca_whirlpools_client::Position::from_bytes(&position_account.data) {
+            Ok(data) => {
+                println!("Position data loaded successfully");
+                data
+            },
+            Err(e) => {
+                println!("Error deserializing position data: {}", e);
+                return Err(anyhow::anyhow!("Failed to deserialize position data: {}", e));
+            }
+        };
         
-        // Initialize with placeholder values - these will be updated
-        // when get_position is called with actual on-chain data
-        let lower_price = 0.0;
-        let upper_price = 0.0;
-        let center_price = 0.0;
+        // Get the whirlpool data for price calculations
+        let _whirlpool = self.get_whirlpool().await?;
         
+        // Calculate prices from tick indices
+        use orca_whirlpools_core::{tick_index_to_price, tick_index_to_sqrt_price, sqrt_price_to_price};
+        
+        let lower_price = tick_index_to_price(
+            position_data.tick_lower_index as i32,
+            self.token_mint_a_decimals,
+            self.token_mint_b_decimals
+        );
+        
+        let upper_price = tick_index_to_price(
+            position_data.tick_upper_index as i32,
+            self.token_mint_a_decimals,
+            self.token_mint_b_decimals
+        );
+        
+        // Calculate center price
+        let position_lower_sqrt_price = tick_index_to_sqrt_price(position_data.tick_lower_index as i32);
+        let position_upper_sqrt_price = tick_index_to_sqrt_price(position_data.tick_upper_index as i32);
+        let position_center_sqrt_price = (position_lower_sqrt_price + position_upper_sqrt_price) / 2;
+        
+        let center_price = sqrt_price_to_price(
+            position_center_sqrt_price,
+            self.token_mint_a_decimals,
+            self.token_mint_b_decimals
+        );
+        
+        // Store the position data
         self.position = Some(Position {
             lower_price,
             upper_price,
             center_price,
             mint_address: position_mint,
             address: position_address,
-            tick_lower_index: whirlpool.tick_current_index - 100, // Placeholder
-            tick_upper_index: whirlpool.tick_current_index + 100, // Placeholder
-            liquidity: 0, // Would be fetched from actual position data
+            tick_lower_index: position_data.tick_lower_index as i32,
+            tick_upper_index: position_data.tick_upper_index as i32,
+            liquidity: position_data.liquidity,
         });
         
-        println!("Loaded existing position: {}", position_mint);
+        println!("Loaded existing position: {} (liquidity: {})", position_mint, position_data.liquidity);
+        println!("Position price range: {} - {}", lower_price, upper_price);
+        
+        // Display position balance estimates if available
+        match close_position_instructions(
+            &self.client.rpc,
+            position_mint,
+            Some(100),
+            Some(self.wallet.pubkey()),
+        ).await {
+            Ok(close_result) => {
+                let token_a_balance = close_result.quote.token_est_a as f64 / 10f64.powi(self.token_mint_a_decimals as i32);
+                let token_b_balance = close_result.quote.token_est_b as f64 / 10f64.powi(self.token_mint_b_decimals as i32);
+                println!(
+                    "Position contains approximately:\n- Token A ({:?}): {:.6}\n- Token B ({:?}): {:.6}",
+                    self.token_mint_a, token_a_balance, self.token_mint_b, token_b_balance
+                );
+            },
+            Err(e) => {
+                println!("Note: Could not retrieve position balances: {}", e);
+            }
+        }
+        
         Ok(())
     }
 
@@ -1510,5 +1665,71 @@ impl PositionManager {
                 Err(anyhow::anyhow!("Failed to get native SOL balance: {}", e))
             }
         }
+    }
+
+    // New function to handle swapping USDC to SOL when needed
+    pub async fn swap_usdc_to_sol_if_needed(&self, required_sol: u64, gas_reserve: u64) -> Result<bool> {
+        // Get current balances
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+        let sol_balance = self.get_balance(sol_mint).await?;
+        let usdc_balance = self.get_balance(self.token_mint_b).await?;
+        
+        // Check if we already have enough SOL
+        let total_sol_needed = required_sol + gas_reserve;
+        if sol_balance >= total_sol_needed {
+            println!("Already have enough SOL: {} (needed: {})", 
+                sol_balance as f64 / 1_000_000_000.0, 
+                total_sol_needed as f64 / 1_000_000_000.0);
+            return Ok(false); // No swap needed
+        }
+        
+        // Calculate how much more SOL we need
+        let sol_shortfall = total_sol_needed - sol_balance;
+        println!("SOL shortfall: {} SOL", sol_shortfall as f64 / 1_000_000_000.0);
+        
+        // Check if USDC is token B (should be the case for SOL/USDC pool)
+        if self.token_mint_b != Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")? {
+            println!("Token B is not USDC, cannot swap to SOL");
+            return Ok(false);
+        }
+        
+        // Calculate how much USDC to swap to get the SOL we need
+        let current_price = self.get_current_price().await?;
+        
+        // Convert SOL amount to USDC based on current price with buffer for slippage
+        // USDC (6 decimals) to SOL (9 decimals) conversion
+        // Formula: usdc_needed = sol_amount * price * (10^6 / 10^9)
+        // Add 5% buffer for slippage and price movement
+        let usdc_amount = ((sol_shortfall as f64 * 1.05 * current_price) / 1_000.0) as u64;
+        
+        println!("Need to swap approximately {} USDC for {} SOL", 
+            usdc_amount as f64 / 1_000_000.0, 
+            sol_shortfall as f64 / 1_000_000_000.0);
+        
+        // Check if we have enough USDC
+        if usdc_balance < usdc_amount {
+            println!("Not enough USDC to swap. Have: {} USDC, Need: {} USDC", 
+                usdc_balance as f64 / 1_000_000.0, 
+                usdc_amount as f64 / 1_000_000.0);
+            return Ok(false);
+        }
+        
+        // Swap USDC to SOL
+        println!("Swapping {} USDC for SOL", usdc_amount as f64 / 1_000_000.0);
+        // Set a higher slippage tolerance for this swap (3%)
+        let result = self.swap_tokens(usdc_amount, self.token_mint_b, sol_mint, Some(sol_shortfall)).await?;
+        
+        // Check if the swap was successful
+        println!("USDC to SOL swap successful! Signature: {}", result);
+        
+        // Verify the updated SOL balance
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        let new_sol_balance = self.get_balance(sol_mint).await?;
+        println!("Updated SOL balance: {} SOL (needed: {} SOL)", 
+            new_sol_balance as f64 / 1_000_000_000.0, 
+            total_sol_needed as f64 / 1_000_000_000.0);
+        
+        // Return success if we now have enough SOL
+        Ok(new_sol_balance >= total_sol_needed)
     }
 }
