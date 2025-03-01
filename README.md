@@ -93,6 +93,67 @@ cargo run --release -- \
   --network devnet
 ```
 
+## Bot Monitoring and Auto-Restart
+
+The bot comes with a monitoring script that automatically restarts it if it crashes or stops running. This is especially useful for long-term, unattended operation.
+
+### Using the Monitor Script
+
+1. The script is located at the root of the project directory: `monitor_whirlpool_bot.sh`
+
+2. Make it executable (if not already):
+   ```bash
+   chmod +x monitor_whirlpool_bot.sh
+   ```
+
+3. Edit the script to configure your desired bot parameters:
+   ```bash
+   # Open the file
+   nano monitor_whirlpool_bot.sh
+   
+   # Update the BOT_CMD line with your preferred parameters
+   BOT_CMD="cargo run --release -- --pool-address YOUR_POOL_ADDRESS --interval 120 --invest 0.15"
+   ```
+
+4. Run the script directly to test:
+   ```bash
+   ./monitor_whirlpool_bot.sh
+   ```
+
+### Setting Up Automatic Monitoring with Crontab
+
+To have your system automatically check and restart the bot if needed:
+
+1. Open your crontab for editing:
+   ```bash
+   crontab -e
+   ```
+
+2. Add a line to run the check every 5 minutes (adjust timing as needed):
+   ```
+   */5 * * * * /full/path/to/whirlpool_bot/monitor_whirlpool_bot.sh
+   ```
+
+3. Save and exit the editor
+
+The script will:
+- Check if the bot is running
+- Start it if it's not running
+- Log all actions to `bot_monitor.log` in the project directory
+- Keep stdout/stderr output in `bot.log`
+
+### Monitoring Logs
+
+You can monitor the bot's activity through the log files:
+
+```bash
+# Monitor script logs
+tail -f bot_monitor.log
+
+# Bot output logs
+tail -f bot.log
+```
+
 ## How It Works
 
 The bot follows these steps:

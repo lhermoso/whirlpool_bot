@@ -1,0 +1,89 @@
+=============================
+🌀 Le∞ Hermos🌀 Whirlpool Bot 
+=============================
+
+Configuration:
+  Network: mainnet
+Invest Amount: 0.15 SOL
+Range Percentage: 2.00%
+Interval: 120 seconds
+Pool Address: Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+Position Mint Address: Auto-detect
+-------------------------------------
+
+Using Solana Mainnet
+Parsing pool address: Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+Pool address parsed successfully: Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+Verifying pool account exists...
+Pool account exists!
+Loading wallet from: wallet.json
+Wallet loaded successfully: Af1jUTtS3TgdG8whiokRkxMfvkcZJafYuTfWoSFgd4Az
+Initializing position manager...
+Fetching whirlpool account data for Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+Account data size: 653 bytes
+Successfully deserialized Whirlpool data
+Fetching token mint info
+Fetching token mint A: So11111111111111111111111111111111111111112
+Token A mint fetched successfully: decimals=9
+Fetching token mint B: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+Token B mint fetched successfully: decimals=6
+Position manager initialized successfully!
+Native SOL balance: 12177134 lamports (0.012177 SOL)
+Native SOL balance: 12177134 lamports (0.012177 SOL)
+Warning: Your SOL balance may be insufficient for the requested investment amount
+You have: 0.012177 SOL, Want to invest: 0.150000 SOL (plus 0.05 SOL gas reserve)
+Consider using a smaller --invest amount
+Fetching positions for wallet: Af1jUTtS3TgdG8whiokRkxMfvkcZJafYuTfWoSFgd4Az
+Found 1 positions or bundles for wallet
+Found matching position: JE3tAxafyUXgYGzEFAKxGbmASp51CjWpRRe5u7XGykcd
+Found 1 positions for the specified whirlpool
+Loading position: JE3tAxafyUXgYGzEFAKxGbmASp51CjWpRRe5u7XGykcd
+Loaded existing position: Ge5A6cZ5i6ym4KaAA1jUmm3XUNaTGJ53Wq4EiJBiFMrt (liquidity: 3061679187)
+Position price range: 138.0276865738955 - 143.71788880760246
+Position contains approximately:
+- Token A (So11111111111111111111111111111111111111112): 0.126162
+- Token B (EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v): 5.356699
+Current price: 139.3307696880156
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.2813901870069
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.69394973067185
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.89744506669012
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.95407821110683
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.9409019586367
+Price within range 138.0276865738955–143.71788880760246
+Current price: 140.0373323257776
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.9011951932487
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.57070289697845
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.4595508151748
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.58163178877064
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.74924854012082
+Price within range 138.0276865738955–143.71788880760246
+Current price: 140.1224581062446
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.89901179436544
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.9703639452775
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.8848358713238
+Price within range 138.0276865738955–143.71788880760246
+Current price: 140.04502320098646
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.84721699778413
+Price within range 138.0276865738955–143.71788880760246
+Current price: 140.0090560313749
+Price within range 138.0276865738955–143.71788880760246
+Current price: 139.9670414043036
+Price within range 138.0276865738955–143.71788880760246
+Current price: 140.11037791351325
+Price within range 138.0276865738955–143.71788880760246
+Current price: 140.29892955682885
+Price within range 138.0276865738955–143.71788880760246
