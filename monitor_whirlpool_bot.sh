@@ -7,7 +7,7 @@ LOG_FILE="$BOT_DIR/bot_monitor.log"
 
 # Your bot command with all necessary parameters
 # Modify this line with your actual command line arguments
-BOT_CMD="cargo run -- --pool-address Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE --interval 120 --invest 0.15"
+BOT_CMD="cargo run -- --pool-address Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE --interval 60 --invest 0.15"
 
 # Function to log messages
 log_message() {
