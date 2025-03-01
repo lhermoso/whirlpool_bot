@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         args.range_percentage,
         args.interval,
         args.pool_address,
-        if args.position_mint_address.is_empty() { "None".to_string() } else { args.position_mint_address.clone() }
+        if args.position_mint_address.is_empty() { "Auto-detect" } else { &args.position_mint_address }
     );
     println!("-------------------------------------\n");
 
@@ -124,8 +124,12 @@ async fn main() -> anyhow::Result<()> {
         println!("Consider using a smaller --invest amount");
     }
  
-    // Try to load existing position if mint address is provided
-    if !args.position_mint_address.is_empty() {
+    // First try to load any existing positions for the wallet
+    let position_loaded = position_manager.load_positions_for_wallet().await?;
+    
+    // If no positions found for wallet and a specific position mint address is provided, try loading that
+    if !position_loaded && !args.position_mint_address.is_empty() {
+        println!("No positions found for wallet, trying to load specific position...");
         position_manager.load_position(&args.position_mint_address).await?;
     }
 
@@ -153,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
                         current_price, position.lower_price, position.upper_price);
                     
                     // Calculate new range centered on current price using percentage
-                    let half_percentage = range_percentage / 2.0;
+                    let half_percentage = range_percentage;
                     let new_lower = current_price * (1.0 - half_percentage / 100.0);
                     let new_upper = current_price * (1.0 + half_percentage / 100.0);
                     

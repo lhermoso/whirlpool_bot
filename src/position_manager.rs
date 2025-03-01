@@ -1,6 +1,6 @@
 use orca_whirlpools::{
     open_position_instructions, close_position_instructions, swap_instructions,
-    IncreaseLiquidityParam, set_funder
+    IncreaseLiquidityParam, set_funder, fetch_positions_for_owner, PositionOrBundle
 };
 use orca_whirlpools_client::{Whirlpool, WHIRLPOOL_ID};
 use orca_whirlpools_core::sqrt_price_to_price;
@@ -466,7 +466,7 @@ impl PositionManager {
                                         if let Some(target_amount) = required_target_amount {
                                             // Check updated balances with multiple retries
                                             let mut attempts = 0;
-                                            let max_balance_check_attempts = 3;
+                                            let max_balance_check_attempts = 30;
                                             
                                             while attempts < max_balance_check_attempts {
                                                 // Check updated balances
@@ -746,11 +746,19 @@ impl PositionManager {
 
         loop {
             // Calculate a reasonable gas reserve based on investment amount
-            let invest_percentage = 0.1; // 10% of investment amount for gas
-            let min_gas_reserve = 10_000_000; // 0.01 SOL minimum
+            let invest_percentage = 0.01; // 1% of investment amount for gas
+            let min_gas_reserve = 1_000_000; // 0.001 SOL minimum
             let max_gas_reserve = 50_000_000; // 0.05 SOL maximum
             let calculated_reserve = (current_amount as f64 * invest_percentage) as u64;
-            let gas_reserve = min_gas_reserve.max(calculated_reserve.min(max_gas_reserve));
+            let base_gas_reserve = min_gas_reserve.max(calculated_reserve.min(max_gas_reserve));
+
+            // Add position creation overhead - this covers the cost of creating position accounts
+            let position_creation_overhead = 5_000_000; // 0.005 SOL for position creation overhead
+            let gas_reserve = base_gas_reserve + position_creation_overhead;
+
+            println!("Using base gas reserve of {} SOL", base_gas_reserve as f64 / 1_000_000_000.0);
+            println!("Adding position creation overhead of {} SOL", position_creation_overhead as f64 / 1_000_000_000.0);
+            println!("Total gas reserve: {} SOL", gas_reserve as f64 / 1_000_000_000.0);
             
             println!("Using gas reserve of {} SOL", gas_reserve as f64 / 1_000_000_000.0);
             
@@ -1214,6 +1222,28 @@ impl PositionManager {
     pub async fn open_position(&mut self, lower_price: f64, upper_price: f64, amount: u64) -> Result<()> {
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
         
+        // Reserve some SOL for position account creation
+        // Each position requires SOL for multiple accounts:
+        // - Position account: ~0.00144 SOL
+        // - Token accounts: ~0.00204 SOL each (if needed)
+        // - Transaction fees: ~0.00005 SOL
+        // Add extra safety margin
+        let position_account_reserve = 5_000_000; // 0.005 SOL
+        let position_investment = if self.token_mint_a == sol_mint {
+            // If token A is SOL, reduce amount to ensure we have enough for account creation
+            if amount > position_account_reserve {
+                amount - position_account_reserve
+            } else {
+                println!("Warning: Investment amount too small to cover position account costs");
+                amount / 2 // Use half of the amount as a fallback
+            }
+        } else {
+            amount // For non-SOL token A, use full amount
+        };
+        
+        println!("Position investment after accounting for account costs: {} lamports ({} SOL)",
+            position_investment, position_investment as f64 / 1_000_000_000.0);
+        
         // Use higher slippage tolerance to account for price movements
         // 300 = 3% slippage tolerance
         let mut slippage_tolerance = Some(300);
@@ -1232,15 +1262,15 @@ impl PositionManager {
             attempt += 1;
             
             // Recreate the param for each attempt since it can't be reused across iterations
-            let param = if self.token_mint_a == sol_mint {
+            let mut param = if self.token_mint_a == sol_mint {
                 // If token A is SOL
-                IncreaseLiquidityParam::TokenA(amount / 2)
+                IncreaseLiquidityParam::TokenA(position_investment)
             } else if self.token_mint_b == sol_mint {
                 // If token B is SOL
-                IncreaseLiquidityParam::TokenB(amount / 2)
+                IncreaseLiquidityParam::TokenB(position_investment)
             } else {
-                // Fallback for non-SOL pairs (not currently handling)
-                IncreaseLiquidityParam::TokenA(amount)
+                // Fallback for non-SOL pairs
+                IncreaseLiquidityParam::TokenA(position_investment)
             };
             
             println!("Creating position with price range: {} - {}", lower_price, upper_price);
@@ -1267,6 +1297,111 @@ impl PositionManager {
             println!("Token max A: {}", result.quote.token_max_a);
             println!("Token max B: {}", result.quote.token_max_b);
             println!("Liquidity: {}", result.quote.liquidity_delta);
+
+            // Verify balances one more time before proceeding
+            let token_a_balance = self.get_balance(self.token_mint_a).await?;
+            let token_b_balance = self.get_balance(self.token_mint_b).await?;
+
+            println!("Current balances:");
+            println!("Token A ({}): {} units", self.token_mint_a, token_a_balance);
+            println!("Token B ({}): {} units", self.token_mint_b, token_b_balance);
+
+            // Account for position creation costs in SOL balance check
+            let effective_token_a_balance = if self.token_mint_a == sol_mint {
+                if token_a_balance > position_account_reserve {
+                    token_a_balance - position_account_reserve
+                } else {
+                    0
+                }
+            } else {
+                token_a_balance
+            };
+
+            println!("Effective token A balance (after overhead): {}", effective_token_a_balance);
+
+            if effective_token_a_balance < result.quote.token_max_a {
+                println!("Warning: Token A balance insufficient after accounting for creation costs");
+                println!("Have: {}, Need: {}, Shortfall: {}", 
+                    effective_token_a_balance, result.quote.token_max_a, 
+                    result.quote.token_max_a - effective_token_a_balance);
+                
+                if attempt == max_retries - 1 {
+                    // On last attempt, try reducing position size
+                    let new_size = (effective_token_a_balance as f64 * 0.9) as u64; // 90% of available balance
+                    println!("Last attempt - reducing position size to: {}", new_size);
+                    if new_size > 0 {
+                        param = if self.token_mint_a == sol_mint {
+                            IncreaseLiquidityParam::TokenA(new_size)
+                        } else if self.token_mint_b == sol_mint {
+                            IncreaseLiquidityParam::TokenB(new_size)
+                        } else {
+                            IncreaseLiquidityParam::TokenA(new_size)
+                        };
+                        // Get a new quote with reduced size
+                        continue;
+                    }
+                }
+            }
+
+            if token_b_balance < result.quote.token_max_b {
+                println!("Warning: Token B balance insufficient");
+                println!("Have: {}, Need: {}, Shortfall: {}", 
+                    token_b_balance, result.quote.token_max_b, 
+                    result.quote.token_max_b - token_b_balance);
+                
+                if attempt == max_retries - 1 {
+                    // On last attempt, try to swap token A for token B if possible
+                    if self.token_mint_a == sol_mint && token_a_balance > result.quote.token_max_a + position_account_reserve {
+                        // We have extra SOL (token A) that we can swap to token B
+                        let token_b_shortfall = result.quote.token_max_b - token_b_balance;
+                        let token_b_shortfall_with_buffer = (token_b_shortfall as f64 * 1.05) as u64; // Add 5% buffer
+                        
+                        // Calculate how much SOL we can spare for the swap
+                        let spare_sol = token_a_balance - result.quote.token_max_a - position_account_reserve;
+                        
+                        println!("Attempting to swap SOL for token B to cover shortfall");
+                        println!("SOL available for swap: {} lamports ({} SOL)", 
+                            spare_sol, spare_sol as f64 / 1_000_000_000.0);
+                        
+                        // Swap SOL for token B
+                        self.swap_tokens(spare_sol, self.token_mint_a, self.token_mint_b, Some(token_b_shortfall_with_buffer)).await?;
+                        
+                        // Wait a moment for balances to update and verify
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        let new_token_b_balance = self.get_balance(self.token_mint_b).await?;
+                        println!("Updated token B balance: {} (needed: {})", new_token_b_balance, result.quote.token_max_b);
+                        
+                        if new_token_b_balance < result.quote.token_max_b {
+                            println!("Warning: After swap, still don't have enough token B. Have: {}, Need: {}", 
+                                new_token_b_balance, result.quote.token_max_b);
+                            
+                            // Since we already attempted a swap and still don't have enough, try to reduce position size
+                            let reduced_size = (new_token_b_balance as f64 * 0.95) as u64; // 95% of available token B
+                            println!("Reducing position size based on available token B: {}", reduced_size);
+                            if reduced_size > 0 {
+                                param = IncreaseLiquidityParam::TokenB(reduced_size);
+                                continue;
+                            }
+                        }
+                    } else if self.token_mint_b == sol_mint && token_b_balance > result.quote.token_max_b {
+                        // We have extra token B (SOL) that we can use to get token A
+                        // Similar swap logic could be implemented here
+                    } else {
+                        // No straightforward swap possible, try reducing position size
+                        let scale_factor = (token_b_balance as f64 / result.quote.token_max_b as f64 * 0.95) as f64;
+                        let new_size = (position_investment as f64 * scale_factor) as u64;
+                        println!("Reducing position size to match available token B: {}", new_size);
+                        if new_size > 0 {
+                            param = if self.token_mint_a == sol_mint {
+                                IncreaseLiquidityParam::TokenA(new_size)
+                            } else {
+                                IncreaseLiquidityParam::TokenB(new_size)
+                            };
+                            continue;
+                        }
+                    }
+                }
+            }
 
             // Prepare all signers including any additional ones provided by the SDK
             let mut signers: Vec<&dyn Signer> = vec![self.wallet.as_ref()];
@@ -1372,7 +1507,7 @@ impl PositionManager {
             let result = close_position_instructions(
                 &self.client.rpc,
                 position.mint_address,
-                Some(100),
+                Some(1000),
                 Some(self.wallet.pubkey()),
             ).await.map_err(|e| anyhow::anyhow!("Close position instruction error: {}", e))?;
 
@@ -1731,5 +1866,131 @@ impl PositionManager {
         
         // Return success if we now have enough SOL
         Ok(new_sol_balance >= total_sol_needed)
+    }
+
+    // New method to fetch and load positions for the wallet
+    pub async fn load_positions_for_wallet(&mut self) -> Result<bool> {
+        println!("Fetching positions for wallet: {}", self.wallet.pubkey());
+        
+        // Fetch all positions for the wallet owner
+        let positions = match fetch_positions_for_owner(&self.client.rpc, self.wallet.pubkey()).await {
+            Ok(positions) => {
+                if positions.is_empty() {
+                    println!("No positions found for wallet: {}", self.wallet.pubkey());
+                    return Ok(false);
+                }
+                
+                println!("Found {} positions or bundles for wallet", positions.len());
+                positions
+            },
+            Err(e) => {
+                println!("Error fetching positions for wallet: {}", e);
+                return Err(anyhow::anyhow!("Failed to fetch positions for wallet: {}", e));
+            }
+        };
+        
+        // Find positions that match our pool_address
+        let mut matching_positions = Vec::new();
+        
+        for position_or_bundle in positions {
+            match position_or_bundle {
+                PositionOrBundle::Position(hydrated_position) => {
+                    // Check if the position is for our whirlpool
+                    if hydrated_position.data.whirlpool == self.pool_address {
+                        println!("Found matching position: {}", hydrated_position.address);
+                        matching_positions.push((
+                            hydrated_position.address,
+                            hydrated_position.data,
+                        ));
+                    }
+                },
+                PositionOrBundle::PositionBundle(hydrated_bundle) => {
+                    // Check bundled positions
+                    for bundled_position in hydrated_bundle.positions {
+                        if bundled_position.data.whirlpool == self.pool_address {
+                            println!("Found matching bundled position: {}", bundled_position.address);
+                            matching_positions.push((
+                                bundled_position.address,
+                                bundled_position.data,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        
+        if matching_positions.is_empty() {
+            println!("No positions found for the specified whirlpool");
+            return Ok(false);
+        }
+        
+        println!("Found {} positions for the specified whirlpool", matching_positions.len());
+        
+        // Process the first matching position
+        let (position_address, position_data) = &matching_positions[0];
+        println!("Loading position: {}", position_address);
+        
+        // Calculate prices from tick indices
+        use orca_whirlpools_core::{tick_index_to_price, tick_index_to_sqrt_price, sqrt_price_to_price};
+        
+        let lower_price = tick_index_to_price(
+            position_data.tick_lower_index as i32,
+            self.token_mint_a_decimals,
+            self.token_mint_b_decimals
+        );
+        
+        let upper_price = tick_index_to_price(
+            position_data.tick_upper_index as i32,
+            self.token_mint_a_decimals,
+            self.token_mint_b_decimals
+        );
+        
+        // Calculate center price
+        let position_lower_sqrt_price = tick_index_to_sqrt_price(position_data.tick_lower_index as i32);
+        let position_upper_sqrt_price = tick_index_to_sqrt_price(position_data.tick_upper_index as i32);
+        let position_center_sqrt_price = (position_lower_sqrt_price + position_upper_sqrt_price) / 2;
+        
+        let center_price = sqrt_price_to_price(
+            position_center_sqrt_price,
+            self.token_mint_a_decimals,
+            self.token_mint_b_decimals
+        );
+        
+        // Store the position data
+        self.position = Some(Position {
+            lower_price,
+            upper_price,
+            center_price,
+            mint_address: position_data.position_mint,
+            address: *position_address,
+            tick_lower_index: position_data.tick_lower_index as i32,
+            tick_upper_index: position_data.tick_upper_index as i32,
+            liquidity: position_data.liquidity,
+        });
+        
+        println!("Loaded existing position: {} (liquidity: {})", position_data.position_mint, position_data.liquidity);
+        println!("Position price range: {} - {}", lower_price, upper_price);
+        
+        // Display position balance estimates if available
+        match close_position_instructions(
+            &self.client.rpc,
+            position_data.position_mint,
+            Some(100),
+            Some(self.wallet.pubkey()),
+        ).await {
+            Ok(close_result) => {
+                let token_a_balance = close_result.quote.token_est_a as f64 / 10f64.powi(self.token_mint_a_decimals as i32);
+                let token_b_balance = close_result.quote.token_est_b as f64 / 10f64.powi(self.token_mint_b_decimals as i32);
+                println!(
+                    "Position contains approximately:\n- Token A ({:?}): {:.6}\n- Token B ({:?}): {:.6}",
+                    self.token_mint_a, token_a_balance, self.token_mint_b, token_b_balance
+                );
+            },
+            Err(e) => {
+                println!("Note: Could not retrieve position balances: {}", e);
+            }
+        }
+        
+        Ok(true)
     }
 }
