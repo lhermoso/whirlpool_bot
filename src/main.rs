@@ -5,6 +5,9 @@ use solana_sdk::pubkey::Pubkey;
 use tokio;
 use orca_whirlpools::set_whirlpools_config_address;
 use orca_whirlpools::WhirlpoolsConfigInput;
+use clap::Parser;
+use tokio::time::Duration;
+use anyhow::Result;
 
 mod cli;
 mod position_manager;
@@ -13,6 +16,66 @@ mod wallet;
 
 use position_manager::PositionManager;
 use solana_utils::SolanaRpcClient;
+
+// Helper function to calculate optimal investment amount based on portfolio value
+async fn calculate_optimal_investment_amount(
+    position_manager: &PositionManager,
+    target_amount: u64,
+    min_viable_position: u64
+) -> Result<Option<u64>> {
+    // Get total portfolio value considering both SOL and USDC
+    let (sol_balance, usdc_balance, total_value_in_sol) = position_manager.get_total_portfolio_value().await?;
+    
+    // Decide on investment amount based on total portfolio value
+    let invest_amount = if total_value_in_sol < target_amount {
+        println!("Warning: Total portfolio value {} SOL is less than requested investment amount {} SOL.", 
+            total_value_in_sol as f64 / 1_000_000_000.0, target_amount as f64 / 1_000_000_000.0);
+        println!("Using available balance with reserve for gas.");
+        total_value_in_sol.saturating_sub(10_000_000) // Reserve 0.01 SOL for gas
+    } else if sol_balance < target_amount && usdc_balance > 0 {
+        // We have enough total value, but it's distributed across tokens
+        println!("We have enough total value ({} SOL), but need to rebalance between SOL and USDC.", 
+            total_value_in_sol as f64 / 1_000_000_000.0);
+        
+        // Try to swap USDC to SOL to meet the target investment amount
+        let sol_needed = target_amount.saturating_sub(sol_balance);
+        println!("Need additional {} SOL. Will try to swap from USDC.", 
+            sol_needed as f64 / 1_000_000_000.0);
+        
+        // Attempt to swap USDC to SOL
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+        match position_manager.swap_usdc_to_sol_if_needed(target_amount, 10_000_000).await {
+            Ok(true) => {
+                // Successfully swapped enough USDC to SOL
+                println!("Successfully converted USDC to SOL.");
+                let updated_sol_balance = position_manager.get_balance(sol_mint).await?;
+                if updated_sol_balance < target_amount {
+                    updated_sol_balance.saturating_sub(10_000_000) // Still reserve some gas
+                } else {
+                    target_amount
+                }
+            },
+            _ => {
+                // Couldn't swap enough, use what we have
+                println!("Could not swap enough USDC to SOL. Using available SOL balance.");
+                sol_balance.saturating_sub(10_000_000)
+            }
+        }
+    } else {
+        // We have enough SOL directly
+        target_amount
+    };
+    
+    // Ensure minimum viable position size
+    if invest_amount < min_viable_position {
+        println!("Warning: Available investment amount {} SOL is below minimum viable position size {} SOL", 
+            invest_amount as f64 / 1_000_000_000.0, min_viable_position as f64 / 1_000_000_000.0);
+        println!("Skipping position creation until more funds are available");
+        return Ok(None);
+    }
+    
+    Ok(Some(invest_amount))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -161,28 +224,49 @@ async fn main() -> anyhow::Result<()> {
                     let new_lower = current_price * (1.0 - half_percentage / 100.0);
                     let new_upper = current_price * (1.0 + half_percentage / 100.0);
                     
-                    // Attempt to close existing position
-                    match position_manager.close_position().await {
-                        Ok(result) => {
-                            println!("Successfully closed position with signature: {}", result.0);
-                            println!("Opening new position at {}–{} (±{}%)", new_lower, new_upper, half_percentage);
-                            
-                            // Verify balances after closing position
-                            let sol_balance = position_manager.get_native_sol_balance().await?;
-                            let invest_amount = if sol_balance < amount {
-                                println!("Warning: SOL balance {} is less than requested investment amount {}. Using available balance.", 
-                                    sol_balance as f64 / 1_000_000_000.0, amount as f64 / 1_000_000_000.0);
-                                sol_balance.saturating_sub(10_000_000) // Reserve 0.01 SOL for gas
-                            } else {
-                                amount
-                            };
-                            
-                            // Open new position with the appropriate amount
-                            position_manager.open_position_with_balance_check(new_lower, new_upper, invest_amount).await?;
-                        },
-                        Err(e) => {
-                            println!("Failed to close position: {}. Will retry next interval.", e);
+                    // Multiple attempts to close the position, with backoff
+                    let mut close_attempts = 0;
+                    let max_close_attempts = 3;
+                    let mut close_successful = false;
+                    
+                    while close_attempts < max_close_attempts && !close_successful {
+                        if close_attempts > 0 {
+                            println!("Retrying position closure (attempt {}/{})", close_attempts + 1, max_close_attempts);
+                            // Wait with increasing backoff before retrying
+                            tokio::time::sleep(Duration::from_secs(5 * close_attempts as u64)).await;
                         }
+                        
+                        // Attempt to close existing position
+                        match position_manager.close_position().await {
+                            Ok(result) => {
+                                println!("Successfully closed position with signature: {}", result.0);
+                                close_successful = true;
+                                
+                                println!("Opening new position at {}–{} (±{}%)", new_lower, new_upper, half_percentage);
+                                
+                                // Calculate optimal investment amount considering both SOL and USDC
+                                let min_viable_position = 50_000_000; // 0.05 SOL
+                                match calculate_optimal_investment_amount(&position_manager, amount, min_viable_position).await? {
+                                    Some(invest_amount) => {
+                                        // Open position with the optimal amount
+                                        println!("Opening new position with {} SOL", invest_amount as f64 / 1_000_000_000.0);
+                                        position_manager.open_position_with_balance_check(new_lower, new_upper, invest_amount).await?;
+                                    },
+                                    None => {
+                                        // Not enough funds to open a viable position
+                                        println!("Insufficient funds to open a viable position. Waiting for next check.");
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                println!("Failed to close position: {}. Attempt {}/{}.", e, close_attempts + 1, max_close_attempts);
+                                close_attempts += 1;
+                            }
+                        }
+                    }
+                    
+                    if !close_successful {
+                        println!("Failed to close position after {} attempts. Will retry next interval.", max_close_attempts);
                     }
                 } else {
                     println!("Price within range {}–{}", position.lower_price, position.upper_price);
@@ -197,19 +281,20 @@ async fn main() -> anyhow::Result<()> {
                 
                 println!("Opening initial position at {}–{} (±{}%)", 
                     lower_price, upper_price, range_percentage);
-                    
-                // Check SOL balance before opening position
-                let sol_balance = position_manager.get_native_sol_balance().await?;
-                let invest_amount = if sol_balance < amount {
-                    println!("Warning: SOL balance {} is less than requested investment amount {}. Using available balance.", 
-                        sol_balance as f64 / 1_000_000_000.0, amount as f64 / 1_000_000_000.0);
-                    sol_balance.saturating_sub(10_000_000) // Reserve 0.01 SOL for gas
-                } else {
-                    amount
-                };
                 
-                // Open position with the appropriate amount
-                position_manager.open_position_with_balance_check(lower_price, upper_price, invest_amount).await?;
+                // Calculate optimal investment amount considering both SOL and USDC
+                let min_viable_position = 50_000_000; // 0.05 SOL
+                match calculate_optimal_investment_amount(&position_manager, amount, min_viable_position).await? {
+                    Some(invest_amount) => {
+                        // Open position with the optimal amount
+                        println!("Opening initial position with {} SOL", invest_amount as f64 / 1_000_000_000.0);
+                        position_manager.open_position_with_balance_check(lower_price, upper_price, invest_amount).await?;
+                    },
+                    None => {
+                        // Not enough funds to open a viable position
+                        println!("Insufficient funds to open a viable position. Waiting for next check.");
+                    }
+                }
             }
         }
 

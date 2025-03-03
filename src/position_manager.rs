@@ -23,6 +23,7 @@ use crate::solana_utils::SolanaRpcClient;
 use tokio_retry::Retry;
 use tokio_retry::strategy::ExponentialBackoff;
 use std::time::Duration;
+use solana_client::rpc_config::UiTransactionEncoding;
 
 const PROGRAM_ID: Pubkey = Pubkey::new_from_array([
     0x6e, 0xeb, 0x65, 0x4a, 0x8e, 0x36, 0xe7, 0x49, 0xd0, 0x8f, 0xb8, 0x33, 0x5c, 0xd3, 0xa8,
@@ -1541,7 +1542,25 @@ impl PositionManager {
                 &signers,
                 recent_blockhash,
             );
+            
+            println!("Sending close position transaction with {} signers...", signers.len());
             let signature = self.client.send_and_confirm_transaction_with_commitment(&tx, CommitmentLevel::Confirmed).await?;
+            println!("Close position transaction sent. Signature: {}", signature);
+            
+            // Get detailed transaction info for debugging
+            match self.client.rpc.get_transaction(&signature, UiTransactionEncoding::Json).await {
+                Ok(tx_info) => {
+                    if let Some(err) = tx_info.transaction.meta.and_then(|m| m.err) {
+                        println!("Warning: Transaction has error: {:?}", err);
+                    } else {
+                        println!("Transaction metadata indicates success!");
+                    }
+                },
+                Err(e) => {
+                    println!("Unable to fetch transaction details: {}", e);
+                }
+            }
+            
             println!("Closed position. Signature: {}", signature);
 
             // Verify that the position is actually closed by checking the position account
@@ -1551,32 +1570,40 @@ impl PositionManager {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             
             // Try to verify that the position is actually closed
-            match self.client.rpc.get_account(&position.address).await {
+            let position_closed = match self.client.rpc.get_account(&position.address).await {
                 Ok(account) => {
                     println!("Warning: Position account still exists after closing! This may indicate a failed closure.");
                     // Try to deserialize to see if it's still a valid position
                     match orca_whirlpools_client::Position::from_bytes(&account.data) {
                         Ok(_) => {
                             println!("Position data still valid - position NOT closed properly!");
-                            return Err(anyhow::anyhow!("Failed to close position: account still exists with valid data"));
+                            false // Position not closed properly
                         },
                         Err(_) => {
                             println!("Position data no longer valid - account may be closing");
+                            true // Consider it closed if data is invalid
                         }
                     }
                 },
                 Err(e) => {
                     if e.to_string().contains("AccountNotFound") {
                         println!("Position account successfully closed (account not found)");
+                        true // Position closed properly
                     } else {
                         println!("Error checking position account: {}", e);
+                        false // Assume not closed on error
                     }
                 }
-            }
+            };
             
-            self.position = None;
-            self.display_balances().await?;
-            Ok((signature, liquidity))
+            // Only update internal state if position was successfully closed
+            if position_closed {
+                self.position = None;
+                self.display_balances().await?;
+                Ok((signature, liquidity))
+            } else {
+                Err(anyhow::anyhow!("Failed to close position: account still exists with valid data"))
+            }
         } else {
             Err(anyhow::anyhow!("No position to close"))
         }
@@ -1992,5 +2019,38 @@ impl PositionManager {
         }
         
         Ok(true)
+    }
+
+    // Calculate the total portfolio value in SOL terms
+    pub async fn get_total_portfolio_value(&self) -> Result<(u64, u64, u64)> {
+        // Get balances for both tokens
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")?;
+        
+        let sol_balance = self.get_balance(sol_mint).await?;
+        let usdc_balance = self.get_balance(usdc_mint).await?;
+        
+        // Get current price to convert USDC to SOL equivalent
+        let current_price = self.get_current_price().await?;
+        
+        // Calculate SOL value of USDC balance (considering decimal differences)
+        // USDC has 6 decimals, SOL has 9 decimals
+        let decimals_difference = 9 - 6; // SOL decimals - USDC decimals
+        let decimals_factor = 10u64.pow(decimals_difference as u32) as f64;
+        
+        // Calculate USDC in SOL terms: (USDC balance / price) * 10^(SOL decimals - USDC decimals)
+        let usdc_in_sol_value = ((usdc_balance as f64 / current_price) * decimals_factor) as u64;
+        
+        // Total value in SOL terms
+        let total_value_in_sol = sol_balance + usdc_in_sol_value;
+        
+        println!("Portfolio value summary:");
+        println!("  SOL balance: {} SOL", sol_balance as f64 / 1_000_000_000.0);
+        println!("  USDC balance: {} USDC", usdc_balance as f64 / 1_000_000.0);
+        println!("  USDC value in SOL terms: {} SOL", usdc_in_sol_value as f64 / 1_000_000_000.0);
+        println!("  Total portfolio value: {} SOL", total_value_in_sol as f64 / 1_000_000_000.0);
+        
+        // Return (SOL balance, USDC balance, total value in SOL terms)
+        Ok((sol_balance, usdc_balance, total_value_in_sol))
     }
 }
