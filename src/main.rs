@@ -10,6 +10,7 @@ mod cli;
 mod position_manager;
 mod solana_utils;
 mod wallet;
+mod utils;
 
 use position_manager::PositionManager;
 use solana_utils::SolanaRpcClient;
